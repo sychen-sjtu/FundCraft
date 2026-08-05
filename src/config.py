@@ -71,6 +71,24 @@ def load_access_passwords(project_root: Path | None = None) -> list[str]:
     return passwords
 
 
+def load_fund_codes(project_root: Path | None = None) -> list[str]:
+    """Load the list of fund codes from the TOML funds section."""
+    root = project_root or Path(__file__).resolve().parents[1]
+    secrets = _read_streamlit_secrets(root)
+    funds = secrets.get("funds", {}) if isinstance(secrets, dict) else {}
+    if not isinstance(funds, dict):
+        return []
+
+    raw_codes = funds.get("fund_codes", [])
+    if isinstance(raw_codes, str):
+        raw_codes = [raw_codes]
+
+    if not isinstance(raw_codes, list):
+        return []
+
+    return [str(code).strip() for code in raw_codes if str(code).strip()]
+
+
 def load_supabase_settings(project_root: Path | None = None, *, secret_password: str | None = None) -> SupabaseSettings:
     """Load Supabase settings from Streamlit secrets or environment-style TOML files."""
     root = project_root or Path(__file__).resolve().parents[1]
