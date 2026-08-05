@@ -77,7 +77,7 @@ create table if not exists public.sync_watermarks (
 create table if not exists public.fund_daily_factors (
     fund_code             text        not null,
     trade_date            date        not null,
-    dividend_yield        numeric     null,    -- 合成股息率(%)
+    dividend_yield        numeric     null,    -- 指数股息率(%)
     annualized_vol        numeric     null,    -- 年化波动率(%)
     max_drawdown          numeric     null,    -- 最大回撤(%)
     dividend_yield_pctile numeric     null,    -- 股息率历史分位(0-100)

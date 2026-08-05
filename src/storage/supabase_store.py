@@ -177,6 +177,53 @@ def upsert_macro_rates(client: Client, rate_df: pd.DataFrame) -> int:
     return len(records)
 
 
+def upsert_index_valuations(client: Client, valuation_df: pd.DataFrame) -> int:
+    """Upsert index valuation rows into index_valuation_history. Returns row count."""
+    required_columns = {"index_code", "trade_date"}
+    missing_columns = required_columns - set(valuation_df.columns)
+    if missing_columns:
+        raise ValueError(f"Missing required valuation columns: {sorted(missing_columns)}")
+
+    float_columns = {"pe1", "pe2", "dividend_yield1", "dividend_yield2"}
+    records = []
+    for row in valuation_df.copy().itertuples(index=False):
+        record: dict = {
+            "index_code": str(getattr(row, "index_code")).strip(),
+            "trade_date": pd.Timestamp(getattr(row, "trade_date")).date().isoformat(),
+        }
+        for column in float_columns:
+            if hasattr(row, column):
+                value = getattr(row, column)
+                if pd.notna(value):
+                    record[column] = float(value)
+        records.append(record)
+
+    if records:
+        client.table("index_valuation_history").upsert(records, on_conflict="index_code,trade_date").execute()
+    return len(records)
+
+
+def fetch_index_valuations(client: Client, index_code: str) -> pd.DataFrame:
+    """Fetch all valuation rows for one index (index_valuation_history)."""
+    query_builder = (
+        client.table("index_valuation_history")
+        .select("index_code, trade_date, pe1, pe2, dividend_yield1, dividend_yield2")
+        .eq("index_code", str(index_code).strip())
+        .order("trade_date")
+    )
+    data = _fetch_all_rows(query_builder)
+    if not data:
+        return pd.DataFrame(columns=["index_code", "trade_date", "pe1", "pe2", "dividend_yield1", "dividend_yield2"])
+
+    df = pd.DataFrame(data)
+    df["index_code"] = df["index_code"].astype(str)
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    for column in ["pe1", "pe2", "dividend_yield1", "dividend_yield2"]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+    return df.dropna(subset=["trade_date", "dividend_yield1"]).reset_index(drop=True)
+
+
 def upsert_daily_factors(client: Client, factors_df: pd.DataFrame) -> int:
     """Upsert daily strategy factors into fund_daily_factors. Returns row count."""
     required_columns = {"fund_code", "trade_date"}
@@ -220,6 +267,14 @@ def upsert_daily_factors(client: Client, factors_df: pd.DataFrame) -> int:
     if records:
         client.table("fund_daily_factors").upsert(records, on_conflict="fund_code,trade_date").execute()
     return len(records)
+
+
+def delete_fund_daily_factors(client: Client, fund_code: str) -> None:
+    """Delete all daily factor rows for one fund.
+
+    因子重算前先清理旧口径数据，避免旧口径（如分红率）残留污染。
+    """
+    client.table("fund_daily_factors").delete().eq("fund_code", normalize_fund_code(fund_code)).execute()
 
 
 def get_watermark(client: Client, entity_type: str, entity_code: str) -> pd.DataFrame:

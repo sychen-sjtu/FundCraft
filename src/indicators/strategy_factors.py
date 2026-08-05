@@ -1,7 +1,8 @@
-"""策略日频因子计算：基于 008163 净值 + 分红 + cn_10y 利率，生成 fund_daily_factors。
+"""策略日频因子计算：基于基金净值 + 底层指数股息率 + cn_10y 利率，生成 fund_daily_factors。
 
 口径说明（对应 docs/数据持久化与增量同步设计方案.md §5）：
-- 合成股息率：见 dividend_yield.compute_dividend_yield_series
+- 股息率：采用该基金对应**底层指数的股息率**（index_valuation_history.dividend_yield1），
+  按日期前向填充对齐到基金净值日；指数估值由每次刷新增量入库累积。
 - 年化波动率：日收益 252 天滚动年化
 - 最大回撤：截至当日的滚动最大回撤（0~负值）
 - 历史分位：对每个因子做「截至当日的扩展窗口百分位」(0~100)
@@ -17,8 +18,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-
-from src.indicators.dividend_yield import compute_dividend_yield_series
 
 VOL_WINDOW_DAYS = 252
 TRADING_DAYS = 252
@@ -67,13 +66,14 @@ def _compute_max_drawdown(unit_nav: pd.Series) -> pd.Series:
 
 def compute_fund_factors(
     nav_df: pd.DataFrame,
-    dividend_df: pd.DataFrame,
+    index_val_df: pd.DataFrame,
     rate_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """计算单只基金的完整日频因子表。
 
     :param nav_df: 净值（fund_code/nav_date/unit_nav），应为全历史。
-    :param dividend_df: 分红（fund_code/ex_date/dividend_per_unit）。
+    :param index_val_df: 底层指数估值（index_code/trade_date/dividend_yield1），
+        由 index_valuation_history 入库累积。
     :param rate_df: cn_10y 利率（rate_code/rate_date/rate_value）。
     :return: fund_daily_factors 所需的 DataFrame（可按 fund_code/trade_date 入库）。
     """
@@ -86,9 +86,19 @@ def compute_fund_factors(
 
     fund_code = str(nav["fund_code"].iloc[0])
 
-    # 1) 合成股息率
-    dy_df = compute_dividend_yield_series(nav, dividend_df)
-    nav = nav.merge(dy_df[["nav_date", "dividend_yield"]], on="nav_date", how="left")
+    # 1) 股息率：采用底层指数股息率（dividend_yield1），按日期前向填充对齐
+    index_val = index_val_df[["trade_date", "dividend_yield1"]].copy()
+    index_val["trade_date"] = pd.to_datetime(index_val["trade_date"], errors="coerce")
+    index_val["dividend_yield1"] = pd.to_numeric(index_val["dividend_yield1"], errors="coerce")
+    index_val = index_val.dropna(subset=["trade_date", "dividend_yield1"]).sort_values("trade_date")
+    if index_val.empty:
+        raise ValueError("缺少底层指数估值数据（股息率），无法计算策略得分。请先同步 index_valuation_history。")
+    nav = nav.merge(
+        index_val.rename(columns={"trade_date": "nav_date", "dividend_yield1": "dividend_yield"}),
+        on="nav_date",
+        how="left",
+    )
+    nav["dividend_yield"] = nav["dividend_yield"].ffill()
 
     # 2) 年化波动率（日收益 252 天滚动）
     daily_return = nav["unit_nav"].pct_change()
@@ -97,10 +107,12 @@ def compute_fund_factors(
     # 3) 最大回撤（截至当日的滚动回撤）
     max_drawdown = _compute_max_drawdown(nav["unit_nav"])
 
-    # 4) 利差 = 合成股息率 - cn_10y（利率按日期前向填充对齐）
+    # 4) 利差 = 指数股息率 - cn_10y（利率按日期前向填充对齐）
     rate = rate_df[["rate_date", "rate_value"]].copy()
     rate["rate_date"] = pd.to_datetime(rate["rate_date"], errors="coerce")
     rate = rate.dropna(subset=["rate_date", "rate_value"]).sort_values("rate_date")
+    if rate.empty:
+        raise ValueError("缺少 cn_10y 利率数据，无法计算利差与策略得分。请先同步 macro_rates_history。")
     nav = nav.merge(
         rate.rename(columns={"rate_date": "nav_date", "rate_value": "cn_10y"}),
         on="nav_date",

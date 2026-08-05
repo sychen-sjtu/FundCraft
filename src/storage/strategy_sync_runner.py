@@ -19,18 +19,32 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.config import load_fund_codes, load_supabase_settings, supabase_settings_ready
+from src.config import (
+    load_factor_fund_codes,
+    load_fund_codes,
+    load_fund_index_codes,
+    load_supabase_settings,
+    supabase_settings_ready,
+)
 from src.fetchers.akshare_fund_nav import (
     fetch_fund_nav_history,
     fetch_fund_profiles,
     normalize_fund_code,
 )
-from src.fetchers.fund_dividend_fetcher import fetch_fund_dividends
+# 注意：AkShare 抓取版与 Supabase 读取版同名，必须用别名区分，否则会发生覆盖
+from src.fetchers.fund_dividend_fetcher import fetch_fund_dividends as fetch_fund_dividends_ak
+from src.fetchers.index_valuation_fetcher import (
+    derive_index_dividend_yield,
+    fetch_index_valuations as fetch_index_valuations_ak,
+    merge_dividend_yield_history,
+)
 from src.fetchers.macro_fetcher import fetch_cn_10y_rate
 from src.indicators.strategy_factors import compute_fund_factors
 from src.storage.supabase_store import (
     create_supabase_client,
-    fetch_fund_dividends,
+    delete_fund_daily_factors,
+    fetch_fund_dividends as fetch_fund_dividends_db,
+    fetch_index_valuations as fetch_index_valuations_db,
     fetch_macro_rates,
     fetch_nav_history,
     get_watermark,
@@ -38,6 +52,7 @@ from src.storage.supabase_store import (
     upsert_daily_factors,
     upsert_fund_dividends,
     upsert_fund_profiles,
+    upsert_index_valuations,
     upsert_macro_rates,
     upsert_nav_history,
     upsert_watermark,
@@ -74,7 +89,7 @@ def sync_single_fund(client, fund_code: str, *, mode: str | None = None) -> dict
     upsert_nav_history(client, upsert_df)
 
     # 分红：全量抓取（数据量小、幂等）
-    dividend_df = fetch_fund_dividends([fund_code])
+    dividend_df = fetch_fund_dividends_ak([fund_code])
     dividend_count = upsert_fund_dividends(client, dividend_df)
 
     # 基础信息（名称/类型/跟踪指数）
@@ -125,44 +140,124 @@ def sync_rate(client, rate_code: str = "cn_10y", *, mode: str | None = None) -> 
     }
 
 
-def recompute_factors(client, fund_code: str) -> dict:
-    """从持久化的净值 + 分红 + 利率重算派生因子并入库。"""
+def sync_index_valuation(client, index_code: str, *, mode: str | None = None) -> dict:
+    """同步指数估值（csindex 近约 20 个交易日，入库累积成历史）。"""
+    watermark_df = get_watermark(client, "index", index_code)
+    has_watermark = not watermark_df.empty
+    if mode is None:
+        mode = "incremental" if has_watermark else "init"
+
+    valuation_df = fetch_index_valuations_ak(index_code)
+    if valuation_df.empty:
+        raise ValueError(f"No valuation data for index {index_code}")
+
+    count = upsert_index_valuations(client, valuation_df)
+    new_last_date = valuation_df["trade_date"].max()
+    upsert_watermark(client, "index", index_code, new_last_date, source="stock_zh_index_value_csindex")
+
+    return {
+        "entity": "index",
+        "index_code": index_code,
+        "mode": mode,
+        "rows": count,
+        "last_date": str(new_last_date.date()),
+    }
+
+
+def recompute_factors(client, fund_code: str, *, index_code: str | None = None) -> dict:
+    """从持久化的净值 + 「推导历史 + 官方近期」股息率 + 利率重算派生因子并入库。
+
+    股息率口径（A2 混合，不污染数据库）：
+    - 官方指数股息率仍走 index_valuation_history 入库累积（源=csindex）；
+    - 推导历史股息率（全收益/价格比）只在内存计算，用于补齐官方缺失的历史，
+      不落库；两者合并时官方值优先。
+    """
     fund_code = normalize_fund_code(fund_code)
     nav_df = fetch_nav_history(client, fund_code)
     if nav_df.empty:
         return {"entity": "fund", "fund_code": fund_code, "factor_rows": 0}
 
-    dividend_df = fetch_fund_dividends(client, fund_code)
+    if index_code is None:
+        index_code = load_fund_index_codes().get(fund_code)
+
+    if index_code:
+        official_df = fetch_index_valuations_db(client, index_code)
+        try:
+            derived_df = derive_index_dividend_yield(index_code)
+        except Exception as exc:  # noqa: BLE001 - 推导失败回退为仅官方
+            print(f"WARN: derive_index_dividend_yield({index_code}) failed: {exc}")
+            derived_df = pd.DataFrame()
+        dividend_history = merge_dividend_yield_history(derived_df, official_df)
+    else:
+        dividend_history = pd.DataFrame()
+
     rate_df = fetch_macro_rates(client, "cn_10y")
-    factors_df = compute_fund_factors(nav_df, dividend_df, rate_df)
+    factors_df = compute_fund_factors(nav_df, dividend_history, rate_df)
+
+    # 先清理旧因子（避免旧口径残留污染），再入库
+    delete_fund_daily_factors(client, fund_code)
     count = upsert_daily_factors(client, factors_df)
     return {"entity": "fund", "fund_code": fund_code, "factor_rows": count}
 
 
-def refresh_with_client(client, fund_codes) -> list[dict]:
-    """使用已连接的 Supabase client 执行一次完整刷新（UI 与 CLI 共用）。"""
+def refresh_with_client(client, fund_codes, *, factor_fund_codes: list[str] | None = None) -> list[dict]:
+    """使用已连接的 Supabase client 执行一次完整刷新（UI 与 CLI 共用）。
+
+    顺序很重要：
+    1. 先同步所有基金的原始数据（净值 + 分红 + 基础信息）；
+    2. 再同步 cn_10y 利率；
+    3. 再同步各基金对应指数的估值（股息率，入库累积）；
+    4. 最后统一重算派生因子（此时 净值/利率/指数估值 都已入库）。
+
+    :param factor_fund_codes: 参与因子计算的基金（由类别面板派生）；为 None 时
+        按 load_factor_fund_codes() 从类别配置推导（panel ∈ FACTOR_PANELS）。
+    """
+    if factor_fund_codes is None:
+        factor_fund_codes = [normalize_fund_code(code) for code in load_factor_fund_codes()]
+
     results: list[dict] = []
     total_rows = 0
 
+    # 1) 同步基金原始数据
     for code in fund_codes:
+        normalized = normalize_fund_code(code)
         try:
-            fund_result = sync_single_fund(client, code)
-            factor_result = recompute_factors(client, code)
-            fund_result.update(factor_result)
+            fund_result = sync_single_fund(client, normalized)
             results.append(fund_result)
             total_rows += int(fund_result["nav_rows"])
         except Exception as exc:  # noqa: BLE001 - 单只失败不阻塞其它基金
-            results.append({"entity": "fund", "fund_code": normalize_fund_code(code), "error": str(exc)})
+            results.append({"entity": "fund", "fund_code": normalized, "error": str(exc)})
 
+    # 2) 同步利率
     try:
         results.append(sync_rate(client, "cn_10y"))
     except Exception as exc:  # noqa: BLE001
         results.append({"entity": "rate", "rate_code": "cn_10y", "error": str(exc)})
 
+    # 3) 同步指数估值（入库累积）——收集所有基金配置的指数代码
+    fund_index_map = load_fund_index_codes()
+    for index_code in sorted({ic for ic in fund_index_map.values() if ic}):
+        try:
+            results.append(sync_index_valuation(client, index_code))
+        except Exception as exc:  # noqa: BLE001
+            results.append({"entity": "index", "index_code": index_code, "error": str(exc)})
+
+    # 4) 统一重算因子（仅策略基金参与；债基现金池只存净值、不计算策略因子）
+    for code in factor_fund_codes:
+        normalized = normalize_fund_code(code)
+        try:
+            factor_result = recompute_factors(client, normalized, index_code=fund_index_map.get(normalized))
+            for existing in results:
+                if existing.get("entity") == "fund" and existing.get("fund_code") == normalized:
+                    existing.update(factor_result)
+                    break
+        except Exception as exc:  # noqa: BLE001
+            results.append({"entity": "fund", "fund_code": normalized, "factor_error": str(exc)})
+
     insert_sync_log(
         client,
         job_name="strategy_refresh",
-        status="success" if not any("error" in r for r in results) else "partial",
+        status="success" if not any("error" in r or "factor_error" in r for r in results) else "partial",
         message=f"Refreshed {len(fund_codes)} funds + cn_10y",
         row_count=total_rows,
     )
@@ -184,13 +279,14 @@ def run_strategy_refresh(project_root: Path | None = None, *, secret_password: s
     if not fund_codes:
         raise ValueError("未在 .streamlit/secrets.toml 中配置基金代码（[funds] fund_codes）。")
 
-    return refresh_with_client(client, fund_codes)
+    factor_fund_codes = load_factor_fund_codes(root)
+    return refresh_with_client(client, fund_codes, factor_fund_codes=factor_fund_codes)
 
 
 def _run_cli() -> None:
     parser = argparse.ArgumentParser(description="FundCraft 策略数据同步（初始化/增量 + 因子重算）")
-    parser.add_argument("--entity", choices=["fund", "rate", "all"], default="all", help="同步实体类型")
-    parser.add_argument("--code", default=None, help="实体代码（基金代码 / cn_10y）")
+    parser.add_argument("--entity", choices=["fund", "rate", "index", "all"], default="all", help="同步实体类型")
+    parser.add_argument("--code", default=None, help="实体代码（基金代码 / cn_10y / 指数代码）")
     parser.add_argument("--mode", choices=["init", "incremental"], default=None, help="强制指定模式；缺省按水位自动判断")
     args = parser.parse_args()
 
@@ -201,13 +297,18 @@ def _run_cli() -> None:
     client = create_supabase_client(settings)
 
     results: list[dict] = []
+    fund_index_map = load_fund_index_codes(root)
+
     if args.entity in ("fund", "all"):
         fund_codes = [normalize_fund_code(args.code)] if args.code else load_fund_codes(root)
+        # 因子重算范围：显式 --code 时对该基金重算；否则只对策略基金重算
+        factor_codes = [normalize_fund_code(args.code)] if args.code else [normalize_fund_code(c) for c in load_factor_fund_codes(root)]
         for code in fund_codes:
             try:
                 fund_result = sync_single_fund(client, code, mode=args.mode)
-                factor_result = recompute_factors(client, code)
-                fund_result.update(factor_result)
+                if normalize_fund_code(code) in factor_codes:
+                    factor_result = recompute_factors(client, code, index_code=fund_index_map.get(normalize_fund_code(code)))
+                    fund_result.update(factor_result)
                 results.append(fund_result)
             except Exception as exc:  # noqa: BLE001
                 results.append({"entity": "fund", "fund_code": code, "error": str(exc)})
@@ -218,6 +319,16 @@ def _run_cli() -> None:
             results.append(sync_rate(client, rate_code, mode=args.mode))
         except Exception as exc:  # noqa: BLE001
             results.append({"entity": "rate", "rate_code": rate_code, "error": str(exc)})
+
+    # 指数估值同步（入库累积）：entity=all 或显式传入指数代码时
+    index_codes_to_sync: list[str] = []
+    if args.entity in ("index", "all"):
+        index_codes_to_sync = [args.code] if args.code else sorted({ic for ic in fund_index_map.values() if ic})
+    for index_code in index_codes_to_sync:
+        try:
+            results.append(sync_index_valuation(client, index_code, mode=args.mode))
+        except Exception as exc:  # noqa: BLE001
+            results.append({"entity": "index", "index_code": index_code, "error": str(exc)})
 
     insert_sync_log(
         client,
