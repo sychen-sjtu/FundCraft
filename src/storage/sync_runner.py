@@ -62,7 +62,7 @@ def run_supabase_sync(project_root: Path | None = None, *, secret_password: str 
         upsert_nav_history(client, df)
         total_rows += int(len(df))
 
-    upsert_fund_profiles(client, fund_codes)
+    upsert_fund_profiles(client, [{"fund_code": code} for code in fund_codes])
 
     summary_df = build_database_summary(client, fund_codes)
 

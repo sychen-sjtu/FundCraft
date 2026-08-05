@@ -46,8 +46,20 @@ def get_supabase_client(project_root: Path | None = None) -> tuple[Client, Supab
     return client, settings
 
 
-def upsert_fund_profiles(client: Client, fund_codes: Iterable[str]) -> None:
-    rows = [{"fund_code": normalize_fund_code(code)} for code in fund_codes]
+def upsert_fund_profiles(client: Client, fund_profiles: Iterable[dict]) -> None:
+    """Upsert fund profiles. Each dict may contain fund_code, fund_name, fund_type, tracking_index."""
+    rows = []
+    for profile in fund_profiles:
+        row: dict = {"fund_code": normalize_fund_code(profile.get("fund_code", ""))}
+        if profile.get("fund_name"):
+            row["fund_name"] = str(profile["fund_name"]).strip()
+        if profile.get("fund_type"):
+            row["fund_type"] = str(profile["fund_type"]).strip()
+        if profile.get("tracking_index"):
+            row["tracking_index"] = str(profile["tracking_index"]).strip()
+        if row["fund_code"]:
+            rows.append(row)
+
     if rows:
         client.table("fund_profiles").upsert(rows, on_conflict="fund_code").execute()
 
@@ -90,13 +102,24 @@ def insert_sync_log(client: Client, *, job_name: str, status: str, message: str,
     ).execute()
 
 
-def fetch_nav_history(client: Client, fund_code: str) -> pd.DataFrame:
+def fetch_nav_history(client: Client, fund_code: str, *, start_date: str | None = None, end_date: str | None = None) -> pd.DataFrame:
+    """Fetch NAV history for one fund, optionally filtered by date range.
+
+    :param start_date/end_date: ISO date strings (YYYY-MM-DD). When given, only
+        rows within the range are returned (used by the dashboard to avoid pulling
+        the full history on every view).
+    """
     query_builder = (
         client.table("fund_nav_history")
         .select("fund_code, nav_date, unit_nav, daily_return")
         .eq("fund_code", normalize_fund_code(fund_code))
         .order("nav_date")
     )
+    if start_date:
+        query_builder = query_builder.gte("nav_date", start_date)
+    if end_date:
+        query_builder = query_builder.lte("nav_date", end_date)
+
     data = _fetch_all_rows(query_builder)
     if not data:
         return pd.DataFrame(columns=["fund_code", "nav_date", "unit_nav", "daily_return"])
@@ -110,14 +133,229 @@ def fetch_nav_history(client: Client, fund_code: str) -> pd.DataFrame:
     return df.dropna(subset=["nav_date", "unit_nav"]).reset_index(drop=True)
 
 
+def upsert_fund_dividends(client: Client, dividend_df: pd.DataFrame) -> int:
+    """Upsert fund dividend records. Returns the number of records written."""
+    required_columns = {"fund_code", "ex_date", "dividend_per_unit"}
+    missing_columns = required_columns - set(dividend_df.columns)
+    if missing_columns:
+        raise ValueError(f"Missing required dividend columns: {sorted(missing_columns)}")
+
+    records = []
+    for row in dividend_df.copy().itertuples(index=False):
+        records.append(
+            {
+                "fund_code": normalize_fund_code(getattr(row, "fund_code")),
+                "ex_date": pd.Timestamp(getattr(row, "ex_date")).date().isoformat(),
+                "dividend_per_unit": float(getattr(row, "dividend_per_unit")),
+            }
+        )
+
+    if records:
+        client.table("fund_dividends").upsert(records, on_conflict="fund_code,ex_date").execute()
+    return len(records)
+
+
+def upsert_macro_rates(client: Client, rate_df: pd.DataFrame) -> int:
+    """Upsert macro rate history. Returns the number of records written."""
+    required_columns = {"rate_code", "rate_date", "rate_value"}
+    missing_columns = required_columns - set(rate_df.columns)
+    if missing_columns:
+        raise ValueError(f"Missing required rate columns: {sorted(missing_columns)}")
+
+    records = []
+    for row in rate_df.copy().itertuples(index=False):
+        records.append(
+            {
+                "rate_code": str(getattr(row, "rate_code")).strip(),
+                "rate_date": pd.Timestamp(getattr(row, "rate_date")).date().isoformat(),
+                "rate_value": float(getattr(row, "rate_value")),
+            }
+        )
+
+    if records:
+        client.table("macro_rates_history").upsert(records, on_conflict="rate_code,rate_date").execute()
+    return len(records)
+
+
+def upsert_daily_factors(client: Client, factors_df: pd.DataFrame) -> int:
+    """Upsert daily strategy factors into fund_daily_factors. Returns row count."""
+    required_columns = {"fund_code", "trade_date"}
+    missing_columns = required_columns - set(factors_df.columns)
+    if missing_columns:
+        raise ValueError(f"Missing required factor columns: {sorted(missing_columns)}")
+
+    bool_columns = {"signal_a", "signal_b"}
+    float_columns = {
+        "dividend_yield",
+        "annualized_vol",
+        "max_drawdown",
+        "dividend_yield_pctile",
+        "spread",
+        "spread_pctile",
+        "dy_vol_ratio_pctile",
+        "drawdown_pctile",
+        "vol_pctile",
+        "score_a",
+        "score_b",
+    }
+
+    records = []
+    for row in factors_df.copy().itertuples(index=False):
+        record: dict = {
+            "fund_code": normalize_fund_code(getattr(row, "fund_code")),
+            "trade_date": pd.Timestamp(getattr(row, "trade_date")).date().isoformat(),
+        }
+        for column in float_columns:
+            if hasattr(row, column):
+                value = getattr(row, column)
+                if pd.notna(value):
+                    record[column] = float(value)
+        for column in bool_columns:
+            if hasattr(row, column):
+                value = getattr(row, column)
+                if pd.notna(value):
+                    record[column] = bool(value)
+        records.append(record)
+
+    if records:
+        client.table("fund_daily_factors").upsert(records, on_conflict="fund_code,trade_date").execute()
+    return len(records)
+
+
+def get_watermark(client: Client, entity_type: str, entity_code: str) -> pd.DataFrame:
+    """Read the sync watermark for one entity. Returns an empty DataFrame if absent."""
+    response = (
+        client.table("sync_watermarks")
+        .select("entity_type, entity_code, last_date, source, updated_at")
+        .eq("entity_type", entity_type)
+        .eq("entity_code", normalize_fund_code(entity_code) if entity_type == "fund" else str(entity_code))
+        .execute()
+    )
+    data = response.data or []
+    if not data:
+        return pd.DataFrame(columns=["entity_type", "entity_code", "last_date", "source", "updated_at"])
+
+    df = pd.DataFrame(data)
+    df["last_date"] = pd.to_datetime(df["last_date"], errors="coerce")
+    df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce")
+    return df
+
+
+def upsert_watermark(client: Client, entity_type: str, entity_code: str, last_date, source: str | None = None) -> None:
+    """Write/update the sync watermark for one entity."""
+    normalized_code = normalize_fund_code(entity_code) if entity_type == "fund" else str(entity_code)
+    row = {
+        "entity_type": entity_type,
+        "entity_code": normalized_code,
+        "last_date": pd.Timestamp(last_date).date().isoformat(),
+    }
+    if source:
+        row["source"] = source
+    client.table("sync_watermarks").upsert([row], on_conflict="entity_type,entity_code").execute()
+
+
+def list_watermarks(client: Client) -> pd.DataFrame:
+    """List all sync watermarks (used by the dashboard to show refresh state)."""
+    query_builder = client.table("sync_watermarks").select("entity_type, entity_code, last_date, source, updated_at").order("updated_at", desc=True)
+    data = _fetch_all_rows(query_builder)
+    if not data:
+        return pd.DataFrame(columns=["entity_type", "entity_code", "last_date", "source", "updated_at"])
+
+    df = pd.DataFrame(data)
+    df["last_date"] = pd.to_datetime(df["last_date"], errors="coerce")
+    df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce")
+    return df
+
+
+def fetch_fund_dividends(client: Client, fund_code: str) -> pd.DataFrame:
+    """Fetch all dividend records for one fund."""
+    query_builder = (
+        client.table("fund_dividends")
+        .select("fund_code, ex_date, dividend_per_unit")
+        .eq("fund_code", normalize_fund_code(fund_code))
+        .order("ex_date")
+    )
+    data = _fetch_all_rows(query_builder)
+    if not data:
+        return pd.DataFrame(columns=["fund_code", "ex_date", "dividend_per_unit"])
+
+    df = pd.DataFrame(data)
+    df["fund_code"] = df["fund_code"].astype(str).apply(normalize_fund_code)
+    df["ex_date"] = pd.to_datetime(df["ex_date"], errors="coerce")
+    df["dividend_per_unit"] = pd.to_numeric(df["dividend_per_unit"], errors="coerce")
+    return df.dropna(subset=["ex_date", "dividend_per_unit"]).reset_index(drop=True)
+
+
+def fetch_macro_rates(client: Client, rate_code: str = "cn_10y") -> pd.DataFrame:
+    """Fetch all rate history for one rate code."""
+    query_builder = (
+        client.table("macro_rates_history")
+        .select("rate_code, rate_date, rate_value")
+        .eq("rate_code", rate_code)
+        .order("rate_date")
+    )
+    data = _fetch_all_rows(query_builder)
+    if not data:
+        return pd.DataFrame(columns=["rate_code", "rate_date", "rate_value"])
+
+    df = pd.DataFrame(data)
+    df["rate_code"] = df["rate_code"].astype(str)
+    df["rate_date"] = pd.to_datetime(df["rate_date"], errors="coerce")
+    df["rate_value"] = pd.to_numeric(df["rate_value"], errors="coerce")
+    return df.dropna(subset=["rate_date", "rate_value"]).reset_index(drop=True)
+
+
+def fetch_daily_factors(client: Client, fund_code: str) -> pd.DataFrame:
+    """Fetch all daily factors for one fund (fund_daily_factors)."""
+    query_builder = (
+        client.table("fund_daily_factors")
+        .select(
+            "fund_code, trade_date, dividend_yield, annualized_vol, max_drawdown, "
+            "dividend_yield_pctile, spread, spread_pctile, dy_vol_ratio_pctile, "
+            "drawdown_pctile, vol_pctile, score_a, signal_a, score_b, signal_b"
+        )
+        .eq("fund_code", normalize_fund_code(fund_code))
+        .order("trade_date")
+    )
+    data = _fetch_all_rows(query_builder)
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
+    df["fund_code"] = df["fund_code"].astype(str).apply(normalize_fund_code)
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    for column in [
+        "dividend_yield",
+        "annualized_vol",
+        "max_drawdown",
+        "dividend_yield_pctile",
+        "spread",
+        "spread_pctile",
+        "dy_vol_ratio_pctile",
+        "drawdown_pctile",
+        "vol_pctile",
+        "score_a",
+        "score_b",
+    ]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+    return df.dropna(subset=["trade_date"]).reset_index(drop=True)
+
+
 def list_fund_profiles(client: Client) -> pd.DataFrame:
-    query_builder = client.table("fund_profiles").select("fund_code").order("fund_code")
+    query_builder = (
+        client.table("fund_profiles")
+        .select("fund_code, fund_name, fund_type, tracking_index, created_at")
+        .order("fund_code")
+    )
     data = _fetch_all_rows(query_builder)
     if not data:
         return pd.DataFrame(columns=["fund_code"])
 
     df = pd.DataFrame(data)
     df["fund_code"] = df["fund_code"].astype(str).apply(normalize_fund_code)
+    if "fund_name" in df.columns:
+        df["fund_name"] = df["fund_name"].astype(object).where(df["fund_name"].notna(), None)
     return df
 
 

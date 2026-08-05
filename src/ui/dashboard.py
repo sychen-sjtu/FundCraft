@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -7,16 +8,22 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from src.config import load_access_passwords, load_supabase_settings, supabase_settings_ready
+from src.config import load_access_passwords, load_fund_codes, load_supabase_settings, supabase_settings_ready
 from src.indicators.fund_metrics import build_drawdown_series, compute_fund_metrics
+from src.storage.strategy_sync_runner import refresh_with_client
 from src.storage.supabase_store import (
     create_supabase_client,
     fetch_latest_sync_job,
     fetch_nav_history,
     list_fund_profiles,
+    list_watermarks,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# UI 时间范围预设（默认近 1 年，避免每次全量拉取）
+RANGE_OPTIONS = ["近1年", "近2年", "近3年", "近5年", "全部"]
+DEFAULT_RANGE = "近1年"
 
 
 def _format_ratio(value: float) -> str:
@@ -24,18 +31,23 @@ def _format_ratio(value: float) -> str:
 
 
 @st.cache_data(ttl=300)
-def load_dashboard_data(secret_password: str) -> dict[str, pd.DataFrame]:
+def load_dashboard_data(
+    secret_password: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, pd.DataFrame]:
     settings = load_supabase_settings(PROJECT_ROOT, secret_password=secret_password)
     client = create_supabase_client(settings)
 
     profiles_df = list_fund_profiles(client)
     latest_sync_df = fetch_latest_sync_job(client)
+    watermarks_df = list_watermarks(client)
 
     nav_frames: list[pd.DataFrame] = []
     summary_rows = []
 
     for fund_code in profiles_df.get("fund_code", pd.Series(dtype=str)).tolist():
-        nav_df = fetch_nav_history(client, fund_code)
+        nav_df = fetch_nav_history(client, fund_code, start_date=start_date, end_date=end_date)
         if nav_df.empty:
             continue
         nav_frames.append(nav_df)
@@ -66,6 +78,9 @@ def load_dashboard_data(secret_password: str) -> dict[str, pd.DataFrame]:
         "summary": summary_df,
         "combined": combined_df,
         "latest_sync": latest_sync_df,
+        "watermarks": watermarks_df,
+        "start_date": start_date,
+        "end_date": end_date,
     }
 
 
@@ -207,6 +222,51 @@ def render_dashboard() -> None:
             st.info("输入解密口令并点击“读取数据”后才会开始加载 Supabase 数据。")
             st.stop()
 
+        # ---------- 分析范围（默认近 1 年） ----------
+        st.divider()
+        st.header("分析范围")
+        range_option = st.selectbox(
+            "时间范围",
+            RANGE_OPTIONS,
+            index=RANGE_OPTIONS.index(DEFAULT_RANGE),
+            help="默认近 1 年，避免每次全量拉取所有历史数据",
+        )
+        if range_option == "全部":
+            start_date: str | None = None
+            end_date: str | None = None
+        else:
+            years = int(range_option[1])  # "近1年" -> 1
+            start_date = (date.today() - timedelta(days=365 * years)).isoformat()
+            end_date = date.today().isoformat()
+
+        # ---------- 数据刷新 ----------
+        st.divider()
+        st.header("数据刷新")
+        st.caption("检查各实体同步水位，缺失部分增量补全，并重算派生因子")
+        if st.button("刷新数据", type="primary"):
+            refresh_secret = str(st.session_state.get("secret_password", "")).strip()
+            if not refresh_secret:
+                st.error("未获取到解密口令，无法刷新。")
+                st.stop()
+
+            with st.spinner("正在同步数据并重算因子..."):
+                try:
+                    refresh_settings = load_supabase_settings(PROJECT_ROOT, secret_password=refresh_secret)
+                    refresh_client = create_supabase_client(refresh_settings)
+                    fund_codes = load_fund_codes(PROJECT_ROOT)
+                    refresh_results = refresh_with_client(refresh_client, fund_codes)
+                    st.session_state["last_refresh_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    st.session_state["last_refresh_results"] = refresh_results
+                    load_dashboard_data.clear()
+                except Exception as exc:
+                    st.error(f"刷新失败: {exc}")
+                else:
+                    st.success("刷新完成，已重新加载数据。")
+                    st.rerun()
+
+        last_refresh = st.session_state.get("last_refresh_time", "暂无")
+        st.caption(f"最近刷新：{last_refresh}")
+
     secret_password = str(st.session_state.get("secret_password", "")).strip()
     if not secret_password:
         st.error("未获取到解密口令。")
@@ -223,7 +283,7 @@ def render_dashboard() -> None:
         st.stop()
 
     try:
-        data_bundle = load_dashboard_data(secret_password)
+        data_bundle = load_dashboard_data(secret_password, start_date=start_date, end_date=end_date)
     except Exception as exc:
         st.error(f"数据加载失败: {exc}")
         st.stop()
@@ -232,18 +292,21 @@ def render_dashboard() -> None:
     summary_df = data_bundle["summary"]
     combined_df = data_bundle["combined"]
     latest_sync_df = data_bundle["latest_sync"]
+    watermarks_df = data_bundle["watermarks"]
 
     total_funds = int(len(profiles_df)) if not profiles_df.empty else 0
     total_rows = int(summary_df["row_count"].sum()) if not summary_df.empty else 0
     latest_sync_text = "暂无"
     if not latest_sync_df.empty and "executed_at" in latest_sync_df.columns:
         latest_sync_text = str(latest_sync_df["executed_at"].iloc[0])
+    range_text = f"{start_date} ~ {end_date}" if start_date else "全历史"
+    last_refresh = st.session_state.get("last_refresh_time", "暂无")
 
     metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
     metric_col1.metric("基金数量", f"{total_funds}")
-    metric_col2.metric("总记录数", f"{total_rows}")
-    metric_col3.metric("最近同步", latest_sync_text[:19] if latest_sync_text != "暂无" else latest_sync_text)
-    metric_col4.metric("展示基金", f"{int(len(summary_df))}")
+    metric_col2.metric("窗口内记录数", f"{total_rows}")
+    metric_col3.metric("展示时间范围", range_text)
+    metric_col4.metric("最近刷新", last_refresh)
 
     tab_overview, tab_detail, tab_data = st.tabs(["总览", "单基金详情", "数据表"])
 
@@ -306,3 +369,12 @@ def render_dashboard() -> None:
         st.dataframe(profiles_df, width="stretch", hide_index=True)
         st.write("同步状态")
         st.dataframe(latest_sync_df, width="stretch", hide_index=True)
+        st.write("同步水位（每个实体已同步到的最大日期）")
+        if watermarks_df.empty:
+            st.info("暂无水位记录。点击侧边栏「刷新数据」完成首次同步。")
+        else:
+            st.dataframe(
+                watermarks_df[["entity_type", "entity_code", "last_date", "source", "updated_at"]],
+                width="stretch",
+                hide_index=True,
+            )

@@ -73,3 +73,43 @@ def save_fund_snapshots(dataframes: Iterable[pd.DataFrame], output_dir: Path) ->
     manifest_path = output_dir / "manifest.csv"
     manifest.to_csv(manifest_path, index=False, encoding="utf-8-sig")
     return manifest_path
+
+
+def fetch_fund_profiles(codes: Iterable[str]) -> list[dict]:
+    """Fetch fund basic info (name / type / tracking index) for the given codes.
+
+    name/type 来自 fund_name_em（一次全量），tracking_index 来自
+    fund_individual_basic_info_xq（逐只，尽力而为，失败则留空）。
+    """
+    target_codes = sorted({normalize_fund_code(code) for code in codes})
+
+    names_df = pd.DataFrame()
+    try:
+        names_df = ak.fund_name_em()
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARN: fund_name_em failed: {exc}")
+
+    profiles: list[dict] = []
+    for code in target_codes:
+        profile: dict = {"fund_code": code}
+
+        if not names_df.empty and "基金代码" in names_df.columns:
+            matched = names_df[names_df["基金代码"].astype(str).str.strip() == code]
+            if not matched.empty:
+                first = matched.iloc[0]
+                profile["fund_name"] = str(first.get("基金简称", "")).strip()
+                profile["fund_type"] = str(first.get("基金类型", "")).strip()
+
+        try:
+            info_df = ak.fund_individual_basic_info_xq(symbol=code)
+            if not info_df.empty and "item" in info_df.columns and "value" in info_df.columns:
+                info_map = dict(zip(info_df["item"].astype(str), info_df["value"].astype(str)))
+                benchmark = info_map.get("业绩比较基准", "").strip()
+                if benchmark:
+                    profile["tracking_index"] = benchmark
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARN: fund_individual_basic_info_xq {code} failed: {exc}")
+
+        profiles.append(profile)
+
+    return profiles
