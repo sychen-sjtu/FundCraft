@@ -1,292 +1,176 @@
+"""FundCraft 主入口：全屏解锁 + 侧边导航 + 页面分发。
+
+流程：
+1. 未解锁（未连接 Supabase）时，显示全屏开屏解锁页（类似系统登录界面），
+   输入解密口令后连接 Supabase 进入主界面。
+2. 解锁后渲染侧边导航（总览 / 数据管理）并分发到各页面；
+   侧边栏默认收起，需要时可展开。
+3. 详情页不在侧边栏中，通过总览页基金卡片进入。
+
+本文件只负责「解锁 + 导航 + 分发」，不堆业务逻辑；数据读取在 src/ui/store.py。
+"""
+
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
-from pathlib import Path
-
-import pandas as pd
 import streamlit as st
 
-from src.config import (
-    FundCategory,
-    load_factor_fund_codes,
-    load_fund_categories,
-    load_fund_codes,
-    load_supabase_settings,
-    supabase_settings_ready,
-)
-from src.fetchers.akshare_fund_nav import normalize_fund_code
-from src.indicators.fund_metrics import compute_fund_metrics
-from src.storage.strategy_sync_runner import refresh_with_client
-from src.storage.supabase_store import (
-    create_supabase_client,
-    fetch_latest_sync_job,
-    fetch_nav_history,
-    list_fund_profiles,
-    list_watermarks,
-)
-from src.ui.panels import render_panel
+from src.ui.theme import inject_global_css
+from src.ui import store
+from src.ui import data as data_view
+from src.ui import detail as detail_view
+from src.ui import home as home_view
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# 页面状态键（稳定值，不含 emoji，避免字符串匹配问题）
+PAGE_HOME = "overview"
+PAGE_DETAIL = "detail"
+PAGE_DATA = "data"
 
-# UI 时间范围预设（默认近 1 年，避免每次全量拉取）
-RANGE_OPTIONS = ["近1年", "近2年", "近3年", "近5年", "全部"]
-DEFAULT_RANGE = "近1年"
+# 侧边导航项：(键, 显示标签)。
+# 策略随基金绑定，在各基金详情页内展示，不放入侧边栏；详情页通过卡片点击进入。
+NAV_ITEMS = [
+    (PAGE_HOME, "📊 总览"),
+    (PAGE_DATA, "🗄️ 数据管理"),
+]
+NAV_KEYS = [key for key, _ in NAV_ITEMS]
+NAV_LABELS = dict(NAV_ITEMS)
 
 
-@st.cache_data(ttl=300)
-def load_dashboard_data(
-    secret_password: str,
-    start_date: str | None = None,
-    end_date: str | None = None,
-) -> dict[str, pd.DataFrame]:
-    settings = load_supabase_settings(PROJECT_ROOT, secret_password=secret_password)
-    client = create_supabase_client(settings)
+def _ensure_session_state() -> None:
+    # 防御：若状态被污染或不在合法页集合内，重置回总览
+    if "page" not in st.session_state or st.session_state["page"] not in (*NAV_KEYS, PAGE_DETAIL):
+        st.session_state["page"] = PAGE_HOME
+    if "selected_fund" not in st.session_state:
+        st.session_state["selected_fund"] = None
 
-    profiles_df = list_fund_profiles(client)
-    latest_sync_df = fetch_latest_sync_job(client)
-    watermarks_df = list_watermarks(client)
 
-    nav_frames: list[pd.DataFrame] = []
-    summary_rows = []
+def _render_lock_screen() -> None:
+    """全屏开屏解锁页（居中卡片式，沿用项目浅色风格）：输入口令后连接 Supabase 进入主界面。"""
+    st.markdown('<div class="lock-spacer"></div>', unsafe_allow_html=True)
 
-    for fund_code in profiles_df.get("fund_code", pd.Series(dtype=str)).tolist():
-        nav_df = fetch_nav_history(client, fund_code, start_date=start_date, end_date=end_date)
-        if nav_df.empty:
-            continue
-        nav_frames.append(nav_df)
-        metrics = compute_fund_metrics(nav_df)
-        summary_rows.append(
-            {
-                "fund_code": metrics.fund_code,
-                "start_date": metrics.start_date,
-                "end_date": metrics.end_date,
-                "row_count": metrics.row_count,
-                "start_unit_nav": metrics.start_unit_nav,
-                "end_unit_nav": metrics.end_unit_nav,
-                "cumulative_return_pct": metrics.cumulative_return_pct,
-                "max_drawdown_pct": metrics.max_drawdown_pct,
-                "annualized_volatility_pct": metrics.annualized_volatility_pct,
-            }
+    col_l, col_m, col_r = st.columns([1, 1.3, 1])
+    with col_m:
+        st.markdown(
+            '<div class="lock-card">'
+            '<div style="text-align:center;">'
+            '<div style="font-size:48px;line-height:1;">📈</div>'
+            '<div style="font-size:24px;font-weight:800;color:#1F2329;margin-top:8px;">FundCraft</div>'
+            '<div style="font-size:13px;color:#8A8F99;margin-top:4px;">基金分析与策略看板</div>'
+            '<div style="margin:18px 0;height:1px;background:#EDEFF2;"></div>'
+            '<div style="font-size:14px;color:#1F2329;font-weight:600;">🔒 身份验证</div>'
+            '<div style="font-size:13px;color:#8A8F99;margin-top:4px;">请输入解密口令以启用系统功能</div>'
+            "</div></div>",
+            unsafe_allow_html=True,
         )
 
-    summary_df = pd.DataFrame(summary_rows).sort_values("fund_code").reset_index(drop=True) if summary_rows else pd.DataFrame()
-    combined_df = pd.concat(nav_frames, ignore_index=True) if nav_frames else pd.DataFrame(columns=["fund_code", "nav_date", "unit_nav", "daily_return"])
-    if not combined_df.empty:
-        combined_df["nav_date"] = pd.to_datetime(combined_df["nav_date"], errors="coerce")
-        combined_df["unit_nav"] = pd.to_numeric(combined_df["unit_nav"], errors="coerce")
-        combined_df = combined_df.dropna(subset=["nav_date", "unit_nav"])
+        password = st.text_input(
+            "解密口令",
+            type="password",
+            key="lock_password",
+            label_visibility="collapsed",
+            placeholder="请输入解密口令",
+        )
+        if st.button("🔓 解锁应用", type="primary", use_container_width=True, key="unlock_btn"):
+            error = store.connect(password or "")
+            if error:
+                st.session_state["lock_error"] = error
+            else:
+                st.session_state.pop("lock_error", None)
+            st.rerun()
 
-    return {
-        "profiles": profiles_df,
-        "summary": summary_df,
-        "combined": combined_df,
-        "latest_sync": latest_sync_df,
-        "watermarks": watermarks_df,
-        "start_date": start_date,
-        "end_date": end_date,
-    }
+        if st.session_state.get("lock_error"):
+            st.error(st.session_state["lock_error"])
 
 
-def _render_category_tab(
-    client,
-    category: "FundCategory",
-    summary_df: pd.DataFrame,
-    combined_df: pd.DataFrame,
-    profiles_df: pd.DataFrame,
-) -> None:
-    """渲染一个基金类别标签页：类别决定面板，类别内每只基金一个看板。"""
-    st.subheader(f"{category.name}")
+def _render_sidebar() -> None:
+    with st.sidebar:
+        st.title("📈 FundCraft")
+        st.caption("基金分析与策略看板")
+        st.divider()
 
-    category_codes = [normalize_fund_code(code) for code in category.fund_codes]
-    cat_summary = summary_df[summary_df["fund_code"].astype(str).isin(category_codes)]
-    if cat_summary.empty or combined_df.empty:
-        st.info(f"{category.name} 类别暂无数据（请先在侧边栏读取数据）。")
-        return
+        # 归一化当前页；详情页归属「总览」分组。任何非法/残留值都回退总览。
+        current = st.session_state.get("page", PAGE_HOME)
+        if current == PAGE_DETAIL:
+            current = PAGE_HOME
+        if current not in NAV_KEYS:
+            current = PAGE_HOME
+            st.session_state["page"] = current
 
-    profiles_by_code: dict[str, pd.Series] = {}
-    if not profiles_df.empty and "fund_code" in profiles_df.columns:
-        profiles_by_code = {str(row["fund_code"]): row for _, row in profiles_df.iterrows()}
+        # key 用固定名 nav_radio：避免复用旧版本残留的组件状态导致 index 不匹配
+        page = st.radio(
+            "导航",
+            NAV_KEYS,
+            index=NAV_KEYS.index(current),
+            format_func=lambda key: NAV_LABELS.get(key, key),
+            label_visibility="collapsed",
+            key="nav_radio",
+        )
 
-    for fund_code in category_codes:
-        fund_code_n = normalize_fund_code(fund_code)
-        if fund_code_n not in cat_summary["fund_code"].astype(str).tolist():
-            continue
+        # 仅当用户真正点选了某个合法导航项时才切换页面
+        if page in NAV_KEYS and page != current:
+            st.session_state["page"] = page
+            st.rerun()
 
-        fund_nav = combined_df[combined_df["fund_code"].astype(str) == fund_code_n].sort_values("nav_date")
-        fund_summary = cat_summary[cat_summary["fund_code"].astype(str) == fund_code_n]
-        summary_row = fund_summary.iloc[0] if not fund_summary.empty else None
-        profile_row = profiles_by_code.get(fund_code_n)
-        fund_name = str(profile_row.get("fund_name")).strip() if profile_row is not None and profile_row.get("fund_name") else ""
+        st.divider()
+        st.caption("数据源：Supabase 真实数据")
+        try:
+            st.caption(f"最近同步：{store.get_latest_sync_time()}")
+        except Exception:  # noqa: BLE001
+            pass
+        if st.button("🔒 锁定 / 断开连接", use_container_width=True):
+            store.disconnect()
+            st.rerun()
 
-        with st.expander(f"{fund_name or fund_code_n}（{fund_code_n}）", expanded=True):
-            render_panel(category.panel, client, fund_code_n, fund_name, category.name, fund_nav, summary_row, profile_row)
+
+def _scroll_to_top_on_page_change() -> None:
+    """页面切换（进入/返回详情）后把滚动条拉回最上方。
+
+    Streamlit 的实际滚动容器是内部 div（stMain），滚动 window 无效，
+    因此需要先定位滚动容器再 scrollTo(0, 0)。
+    """
+    page = st.session_state.get("page")
+    prev = st.session_state.get("_prev_page")
+    if prev is not None and prev != page:
+        scroll_js = (
+            "<script>"
+            "window.addEventListener('load',function(){"
+            "var p=window.parent;"
+            "var sels=['[data-testid=\"stMain\"]','[data-testid=\"stAppViewContainer\"]'];"
+            "for(var i=0;i<sels.length;i++){"
+            "var el=p.document.querySelector(sels[i]);"
+            "if(el&&el.scrollTo){try{el.scrollTo(0,0);}catch(e){}}}"
+            "try{p.scrollTo(0,0);}catch(e){}"
+            "});"
+            "</script>"
+        )
+        st.iframe(scroll_js, height=1)
+    st.session_state["_prev_page"] = page
 
 
 def render_dashboard() -> None:
-    st.set_page_config(page_title="FundCraft", page_icon="📊", layout="wide")
+    st.set_page_config(
+        page_title="FundCraft",
+        page_icon="📈",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
 
-    st.title("📊 FundCraft")
-    st.caption("基于 Supabase 的基金数据展示与策略分析")
+    inject_global_css()
+    _ensure_session_state()
 
-    if "secret_password" not in st.session_state:
-        st.session_state["secret_password"] = ""
-    if "data_loaded" not in st.session_state:
-        st.session_state["data_loaded"] = False
+    # 未解锁：显示全屏开屏界面，不渲染侧边栏与页面
+    if not store.is_connected():
+        _render_lock_screen()
+        return
 
-    with st.sidebar:
-        st.header("数据访问")
-        st.caption("请输入口令后读取 Supabase 数据")
+    _render_sidebar()
+    _scroll_to_top_on_page_change()
 
-        secret_password_input = st.text_input("请输入口令", type="password", help="用于解密 secrets.toml 中的 url/key")
-        if st.button("读取数据", type="primary"):
-            if not secret_password_input.strip():
-                st.error("请输入口令。")
-                st.stop()
+    page = st.session_state["page"]
 
-            try:
-                settings = load_supabase_settings(PROJECT_ROOT, secret_password=secret_password_input)
-            except Exception as exc:
-                st.error(f"配置读取失败: {exc}")
-                st.stop()
+    if page == PAGE_DETAIL:
+        detail_view.render()
+    elif page == PAGE_DATA:
+        data_view.render()
+    else:
+        home_view.render()
 
-            if not supabase_settings_ready(settings):
-                st.error("Supabase 配置不完整。")
-                st.stop()
-
-            st.session_state["secret_password"] = secret_password_input
-            st.session_state["data_loaded"] = True
-            st.rerun()
-
-        if not st.session_state["data_loaded"]:
-            st.info("请输入口令并点击“读取数据”后才会开始加载 Supabase 数据。")
-            st.stop()
-
-        # ---------- 分析范围（默认近 1 年） ----------
-        st.divider()
-        st.header("分析范围")
-        range_option = st.selectbox(
-            "时间范围",
-            RANGE_OPTIONS,
-            index=RANGE_OPTIONS.index(DEFAULT_RANGE),
-            help="默认近 1 年，避免每次全量拉取所有历史数据",
-        )
-        if range_option == "全部":
-            start_date: str | None = None
-            end_date: str | None = None
-        else:
-            years = int(range_option[1])  # "近1年" -> 1
-            start_date = (date.today() - timedelta(days=365 * years)).isoformat()
-            end_date = date.today().isoformat()
-
-        # ---------- 数据刷新 ----------
-        st.divider()
-        st.header("数据刷新")
-        st.caption("检查各实体同步水位，缺失部分增量补全，并重算派生因子")
-        if st.button("刷新数据", type="primary"):
-            refresh_secret = str(st.session_state.get("secret_password", "")).strip()
-            if not refresh_secret:
-                st.error("未获取到口令，无法刷新。")
-                st.stop()
-
-            with st.spinner("正在同步数据并重算因子..."):
-                try:
-                    refresh_settings = load_supabase_settings(PROJECT_ROOT, secret_password=refresh_secret)
-                    refresh_client = create_supabase_client(refresh_settings)
-                    fund_codes = load_fund_codes(PROJECT_ROOT)
-                    factor_fund_codes = load_factor_fund_codes(PROJECT_ROOT)
-                    refresh_results = refresh_with_client(
-                        refresh_client,
-                        fund_codes,
-                        factor_fund_codes=factor_fund_codes,
-                    )
-                    st.session_state["last_refresh_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    st.session_state["last_refresh_results"] = refresh_results
-                    load_dashboard_data.clear()
-                except Exception as exc:
-                    st.error(f"刷新失败: {exc}")
-                else:
-                    st.success("刷新完成，已重新加载数据。")
-                    st.rerun()
-
-        last_refresh = st.session_state.get("last_refresh_time", "暂无")
-        st.caption(f"最近刷新：{last_refresh}")
-
-        last_results = st.session_state.get("last_refresh_results", [])
-        if last_results:
-            with st.expander("查看本次刷新结果"):
-                for item in last_results:
-                    if "error" in item or "factor_error" in item:
-                        st.error(str(item))
-                    else:
-                        st.write(str(item))
-
-    secret_password = str(st.session_state.get("secret_password", "")).strip()
-    if not secret_password:
-        st.error("未获取到口令。")
-        st.stop()
-
-    try:
-        settings = load_supabase_settings(PROJECT_ROOT, secret_password=secret_password)
-    except Exception as exc:
-        st.error(f"配置读取失败: {exc}")
-        st.stop()
-
-    if not supabase_settings_ready(settings):
-        st.error("Supabase 配置不完整。")
-        st.stop()
-
-    try:
-        data_bundle = load_dashboard_data(secret_password, start_date=start_date, end_date=end_date)
-    except Exception as exc:
-        st.error(f"数据加载失败: {exc}")
-        st.stop()
-
-    profiles_df = data_bundle["profiles"]
-    summary_df = data_bundle["summary"]
-    combined_df = data_bundle["combined"]
-    latest_sync_df = data_bundle["latest_sync"]
-    watermarks_df = data_bundle["watermarks"]
-
-    total_funds = int(len(profiles_df)) if not profiles_df.empty else 0
-    total_rows = int(summary_df["row_count"].sum()) if not summary_df.empty else 0
-    range_text = f"{start_date} ~ {end_date}" if start_date else "全历史"
-    last_refresh = st.session_state.get("last_refresh_time", "暂无")
-
-    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-    metric_col1.metric("基金数量", f"{total_funds}")
-    metric_col2.metric("窗口内记录数", f"{total_rows}")
-    metric_col3.metric("展示时间范围", range_text)
-    metric_col4.metric("最近刷新", last_refresh)
-
-    # 类别面板需要额外读取数据（分红 / 策略因子），共用一个 client
-    client = create_supabase_client(settings)
-
-    categories = load_fund_categories(PROJECT_ROOT)
-    tab_names = ["总览"] + list(categories.keys()) + ["数据表"]
-    tabs = st.tabs(tab_names)
-
-    with tabs[0]:
-        st.subheader("基金概览")
-        st.caption("各类别基金数量（明细请到对应类别页查看）")
-        for name, cat in categories.items():
-            st.markdown(f"- **{name}**：{len(cat.fund_codes)} 只基金")
-
-    for index, category in enumerate(categories.values(), start=1):
-        with tabs[index]:
-            _render_category_tab(client, category, summary_df, combined_df, profiles_df)
-
-    with tabs[-1]:
-        st.subheader("原始数据表")
-        st.write("基金基础信息")
-        st.dataframe(profiles_df, width="stretch", hide_index=True)
-        st.write("同步状态")
-        st.dataframe(latest_sync_df, width="stretch", hide_index=True)
-        st.write("同步水位（每个实体已同步到的最大日期）")
-        if watermarks_df.empty:
-            st.info("暂无水位记录。点击侧边栏「刷新数据」完成首次同步。")
-        else:
-            st.dataframe(
-                watermarks_df[["entity_type", "entity_code", "last_date", "source", "updated_at"]],
-                width="stretch",
-                hide_index=True,
-            )

@@ -89,7 +89,7 @@ def load_fund_categories(project_root: Path | None = None) -> dict[str, FundCate
     """Load fund categories from the TOML [funds.categories] section.
 
     结构示例：
-        [funds.categories."低波红利"]
+        [funds.categories."红利低波"]
         fund_codes = ["008163"]
         panel = "红利低波"          # 决定该类别基金的展示面板（缺省为「净值」）
 
