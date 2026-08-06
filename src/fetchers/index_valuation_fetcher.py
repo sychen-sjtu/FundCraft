@@ -135,3 +135,29 @@ def fetch_index_valuations(index_code: str) -> pd.DataFrame:
         .reset_index(drop=True)
     )
     return val_df[["index_code", "trade_date", "pe1", "pe2", "dividend_yield1", "dividend_yield2", "source"]]
+
+
+def fetch_index_price(index_code: str) -> pd.DataFrame:
+    """抓取指数价格收盘历史（全历史，csindex 官方行情）。
+
+    策略口径 C（gemini 文档）：波动率 / 最大回撤取【指数价格】，而非基金净值。
+    返回 trade_date / close（升序）。
+    """
+    raw_df = ak.stock_zh_index_hist_csindex(
+        symbol=index_code,
+        start_date="20000101",
+        end_date=date.today().strftime("%Y%m%d"),
+    )
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame(columns=["trade_date", "close"])
+
+    price_df = raw_df[["日期", "收盘"]].rename(columns={"日期": "trade_date", "收盘": "close"}).copy()
+    price_df["trade_date"] = pd.to_datetime(price_df["trade_date"], errors="coerce")
+    price_df["close"] = pd.to_numeric(price_df["close"], errors="coerce")
+    price_df = (
+        price_df.dropna(subset=["trade_date", "close"])
+        .drop_duplicates(subset=["trade_date"], keep="last")
+        .sort_values("trade_date")
+        .reset_index(drop=True)
+    )
+    return price_df[["trade_date", "close"]]

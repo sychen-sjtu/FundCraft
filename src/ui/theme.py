@@ -165,15 +165,22 @@ GLOBAL_CSS = """
 /* 侧边栏微调 */
 [data-testid="stSidebar"] { background: #FFFFFF; }
 
-/* 开屏解锁（沿用项目浅色风格） */
-.lock-spacer { height: 13vh; }
-.lock-card {
-  background: #FFFFFF;
-  border: 1px solid #EDEFF2;
-  border-radius: 14px;
-  padding: 30px 26px 24px;
-  box-shadow: 0 6px 24px rgba(31,35,41,0.08);
+/* 开屏解锁：统一表单卡片（Logo/标题/口令/按钮全部在卡片内） */
+.lock-spacer { height: 3vh; }
+.st-key-lock_panel {
+  background: #FFFFFF !important;
+  border: 1px solid #EDEFF2 !important;
+  border-radius: 14px !important;
+  padding: 32px 30px 28px !important;
+  box-shadow: 0 6px 24px rgba(31,35,41,0.08) !important;
 }
+.lock-head { text-align: center; }
+.lock-icon { font-size: 48px; line-height: 1; }
+.lock-app { font-size: 24px; font-weight: 800; color: #1F2329; margin-top: 10px; }
+.lock-sub { font-size: 13px; color: #8A8F99; margin-top: 6px; }
+.lock-divider { height: 1px; background: #EDEFF2; margin: 22px 0 18px; }
+.lock-title { text-align: center; font-size: 14px; font-weight: 600; color: #1F2329; margin-bottom: 8px; }
+.lock-gap { height: 14px; }
 
 /* 主按钮：项目蓝色主题（覆盖 Streamlit 默认红色，避免刺眼） */
 [data-testid="stBaseButton-primary"] {

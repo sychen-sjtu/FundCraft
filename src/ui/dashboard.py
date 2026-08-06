@@ -44,41 +44,41 @@ def _ensure_session_state() -> None:
 
 
 def _render_lock_screen() -> None:
-    """全屏开屏解锁页（居中卡片式，沿用项目浅色风格）：输入口令后连接 Supabase 进入主界面。"""
+    """全屏开屏解锁页：统一白色卡片（Logo/标题/身份验证/口令/按钮全部在卡片内），沿用项目浅色风格。"""
     st.markdown('<div class="lock-spacer"></div>', unsafe_allow_html=True)
 
     col_l, col_m, col_r = st.columns([1, 1.3, 1])
     with col_m:
-        st.markdown(
-            '<div class="lock-card">'
-            '<div style="text-align:center;">'
-            '<div style="font-size:48px;line-height:1;">📈</div>'
-            '<div style="font-size:24px;font-weight:800;color:#1F2329;margin-top:8px;">FundCraft</div>'
-            '<div style="font-size:13px;color:#8A8F99;margin-top:4px;">基金分析与策略看板</div>'
-            '<div style="margin:18px 0;height:1px;background:#EDEFF2;"></div>'
-            '<div style="font-size:14px;color:#1F2329;font-weight:600;">🔒 身份验证</div>'
-            '<div style="font-size:13px;color:#8A8F99;margin-top:4px;">请输入解密口令以启用系统功能</div>'
-            "</div></div>",
-            unsafe_allow_html=True,
-        )
+        with st.container(border=True, key="lock_panel"):
+            st.markdown(
+                '<div class="lock-head">'
+                '<div class="lock-icon">📈</div>'
+                '<div class="lock-app">FundCraft</div>'
+                '<div class="lock-sub">基金分析与策略看板</div>'
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown('<div class="lock-divider"></div>', unsafe_allow_html=True)
+            st.markdown('<div class="lock-title">身份验证</div>', unsafe_allow_html=True)
 
-        password = st.text_input(
-            "解密口令",
-            type="password",
-            key="lock_password",
-            label_visibility="collapsed",
-            placeholder="请输入解密口令",
-        )
-        if st.button("🔓 解锁应用", type="primary", use_container_width=True, key="unlock_btn"):
-            error = store.connect(password or "")
-            if error:
-                st.session_state["lock_error"] = error
-            else:
-                st.session_state.pop("lock_error", None)
-            st.rerun()
+            password = st.text_input(
+                "解密口令",
+                type="password",
+                key="lock_password",
+                label_visibility="collapsed",
+                placeholder="请输入解密口令",
+            )
+            st.markdown('<div class="lock-gap"></div>', unsafe_allow_html=True)
+            if st.button("🔓 解锁应用", type="primary", use_container_width=True, key="unlock_btn"):
+                error = store.connect(password or "")
+                if error:
+                    st.session_state["lock_error"] = error
+                else:
+                    st.session_state.pop("lock_error", None)
+                st.rerun()
 
-        if st.session_state.get("lock_error"):
-            st.error(st.session_state["lock_error"])
+            if st.session_state.get("lock_error"):
+                st.error(st.session_state["lock_error"])
 
 
 def _render_sidebar() -> None:

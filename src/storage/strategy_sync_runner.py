@@ -35,11 +35,12 @@ from src.fetchers.akshare_fund_nav import (
 from src.fetchers.fund_dividend_fetcher import fetch_fund_dividends as fetch_fund_dividends_ak
 from src.fetchers.index_valuation_fetcher import (
     derive_index_dividend_yield,
+    fetch_index_price,
     fetch_index_valuations as fetch_index_valuations_ak,
     merge_dividend_yield_history,
 )
 from src.fetchers.macro_fetcher import fetch_cn_10y_rate
-from src.indicators.strategy_factors import compute_fund_factors
+from src.indicators.strategy_factors import SAMPLE_START, compute_fund_factors
 from src.storage.supabase_store import (
     create_supabase_client,
     delete_fund_daily_factors,
@@ -188,11 +189,24 @@ def recompute_factors(client, fund_code: str, *, index_code: str | None = None) 
             print(f"WARN: derive_index_dividend_yield({index_code}) failed: {exc}")
             derived_df = pd.DataFrame()
         dividend_history = merge_dividend_yield_history(derived_df, official_df)
+        # 口径 C：波动率 / 最大回撤取【指数价格】（全历史），失败回退基金净值
+        try:
+            index_price = fetch_index_price(index_code)
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARN: fetch_index_price({index_code}) failed: {exc}")
+            index_price = pd.DataFrame()
     else:
         dividend_history = pd.DataFrame()
+        index_price = pd.DataFrame()
 
     rate_df = fetch_macro_rates(client, "cn_10y")
-    factors_df = compute_fund_factors(nav_df, dividend_history, rate_df)
+    factors_df = compute_fund_factors(
+        nav_df,
+        dividend_history,
+        rate_df,
+        index_price_df=index_price,
+        sample_start=SAMPLE_START,
+    )
 
     # 先清理旧因子（避免旧口径残留污染），再入库
     delete_fund_daily_factors(client, fund_code)
