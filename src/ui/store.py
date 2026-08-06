@@ -28,8 +28,6 @@ from src.config import (
     load_supabase_settings,
     supabase_settings_ready,
 )
-from src.fetchers.akshare_fund_nav import normalize_fund_code
-from src.storage.strategy_sync_runner import refresh_with_client
 from src.storage.supabase_store import (
     create_supabase_client,
     fetch_daily_factors,
@@ -38,6 +36,13 @@ from src.storage.supabase_store import (
     list_fund_profiles,
     list_watermarks,
 )
+
+
+def normalize_fund_code(code) -> str:
+    """基金代码规范化（内联，避免在模块导入期拉取抓取层/akshare）。"""
+    normalized = str(code).strip()
+    return normalized.zfill(6) if normalized.isdigit() and len(normalized) < 6 else normalized
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -477,6 +482,9 @@ def run_refresh(full: bool = False) -> tuple[list[dict], str | None]:
             _clear_watermarks(client)
         fund_codes = get_fund_codes()
         factor_fund_codes = [normalize_fund_code(code) for code in load_factor_fund_codes(PROJECT_ROOT)]
+        # 惰性导入：刷新编排较重（含 akshare 抓取链），避免在页面启动时加载
+        from src.storage.strategy_sync_runner import refresh_with_client
+
         results = refresh_with_client(client, fund_codes, factor_fund_codes=factor_fund_codes)
         _invalidate_caches()
         return results, None

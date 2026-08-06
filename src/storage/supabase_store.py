@@ -9,7 +9,12 @@ import pandas as pd
 from supabase import Client, create_client
 
 from src.config import SupabaseSettings, load_supabase_settings, supabase_settings_ready
-from src.fetchers.akshare_fund_nav import normalize_fund_code
+
+
+def normalize_fund_code(code) -> str:
+    """基金代码规范化（内联，避免在模块导入期拉取抓取层/akshare）。"""
+    normalized = str(code).strip()
+    return normalized.zfill(6) if normalized.isdigit() and len(normalized) < 6 else normalized
 
 
 def _fetch_all_rows(query_builder, *, page_size: int = 1000) -> list[dict]:

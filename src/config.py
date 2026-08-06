@@ -11,8 +11,6 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback is not expected here
     import tomli as tomllib  # type: ignore[no-redef]
 
-from src.security.secret_crypto import decrypt_text, is_encrypted_value
-
 
 @dataclass(frozen=True)
 class SupabaseSettings:
@@ -200,6 +198,9 @@ def load_supabase_settings(project_root: Path | None = None, *, secret_password:
     def _resolve_value(raw_value: str) -> str:
         if not raw_value:
             return ""
+
+        # 惰性导入安全层：避免在模块导入期拉取 cryptography 等重依赖（云端 Python 3.14 更稳）
+        from src.security.secret_crypto import decrypt_text, is_encrypted_value
 
         encrypted = is_encrypted_value(raw_value)
         if not encrypted:
