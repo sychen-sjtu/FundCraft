@@ -32,6 +32,18 @@ class FundCategory:
 DEFAULT_PANEL = "净值"
 
 
+@dataclass(frozen=True)
+class IndexSpec:
+    """指数注册表条目（TOML [indexes.registry] → index_master）。"""
+
+    index_code: str
+    index_name: str = ""
+    index_category: str = "strategy"  # strategy / benchmark / broad
+    is_total_return: bool = False
+    exchange: str = ""
+    source: str = "csindex"
+
+
 def _resolve_secret_password(url_value: str, key_value: str, secret_password: str | None) -> str:
     if secret_password:
         return secret_password
@@ -53,34 +65,6 @@ def _read_streamlit_secrets(project_root: Path) -> dict[str, Any]:
 
     with secrets_path.open("rb") as file_obj:
         return tomllib.load(file_obj)
-
-
-def load_access_password(project_root: Path | None = None) -> str:
-    passwords = load_access_passwords(project_root)
-    return passwords[0] if passwords else ""
-
-
-def load_access_passwords(project_root: Path | None = None) -> list[str]:
-    root = project_root or Path(__file__).resolve().parents[1]
-    secrets = _read_streamlit_secrets(root)
-    security = secrets.get("security", {}) if isinstance(secrets, dict) else {}
-    if not isinstance(security, dict):
-        return []
-
-    raw_passwords = security.get("access_password", [])
-    if isinstance(raw_passwords, str):
-        raw_passwords = [raw_passwords]
-
-    if not isinstance(raw_passwords, list):
-        return []
-
-    passwords: list[str] = []
-    for password in raw_passwords:
-        normalized = str(password).strip()
-        if normalized:
-            passwords.append(normalized)
-
-    return passwords
 
 
 def load_fund_categories(project_root: Path | None = None) -> dict[str, FundCategory]:
@@ -152,6 +136,48 @@ def load_fund_index_codes(project_root: Path | None = None) -> dict[str, str]:
         for fund_code, index_code in category.index_codes.items():
             mapping[fund_code] = index_code
     return mapping
+
+
+def load_index_registry(project_root: Path | None = None) -> dict[str, IndexSpec]:
+    """读取指数注册表（TOML [indexes.registry]），同步时写入 index_master。
+
+    :return: {index_code: IndexSpec}
+    """
+    root = project_root or Path(__file__).resolve().parents[1]
+    secrets = _read_streamlit_secrets(root)
+    indexes = secrets.get("indexes", {}) if isinstance(secrets, dict) else {}
+    registry = indexes.get("registry", {}) if isinstance(indexes, dict) else {}
+
+    result: dict[str, IndexSpec] = {}
+    if isinstance(registry, dict):
+        for code, cfg in registry.items():
+            code_s = str(code).strip()
+            if not code_s or not isinstance(cfg, dict):
+                continue
+            result[code_s] = IndexSpec(
+                index_code=code_s,
+                index_name=str(cfg.get("name", "")).strip(),
+                index_category=str(cfg.get("category", "strategy")).strip() or "strategy",
+                is_total_return=bool(cfg.get("total_return", False)),
+                exchange=str(cfg.get("exchange", "")).strip(),
+                source=str(cfg.get("source", "csindex")).strip() or "csindex",
+            )
+    return result
+
+
+def load_fund_tracking_index(project_root: Path | None = None) -> list[tuple[str, str, str]]:
+    """读取基金→指数映射配置（[funds.categories.*].index_codes）。
+
+    返回 [(fund_code, index_code, role)]；当前 index_codes 均为策略底层指数，role='strategy'。
+    后续如需区分基准指数，可在类别配置里扩展 role。
+    """
+    root = project_root or Path(__file__).resolve().parents[1]
+    categories = load_fund_categories(root)
+    rows: list[tuple[str, str, str]] = []
+    for category in categories.values():
+        for fund_code, index_code in category.index_codes.items():
+            rows.append((fund_code, index_code, "strategy"))
+    return rows
 
 
 def load_fund_codes(project_root: Path | None = None) -> list[str]:

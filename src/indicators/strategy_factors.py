@@ -1,10 +1,10 @@
-"""策略日频因子计算：基于底层指数价格/股息率 + cn_10y 利率，生成 fund_daily_factors。
+"""指数层日频策略因子计算：基于指数股息率/全收益价格 + cn_10y 利率，生成 index_daily_factors。
 
-口径说明（口径 C，对齐 gemini-code 文档与参考策略）：
-- 股息率：采用该基金对应**底层指数的股息率**（index_valuation_history.dividend_yield1），
-  按日期前向填充对齐；指数估值由每次刷新增量入库累积。
-- 年化波动率：**底层指数价格**日收益 252 天滚动年化（传入 index_price_df 时取指数，否则回退基金净值）
-- 最大回撤：**底层指数价格**截至当日的滚动最大回撤（0~负值）
+口径说明（对齐 gemini-code 文档与参考策略）：
+- 股息率：底层指数股息率（index_valuation_history.dividend_yield，官方近20日 + 推导历史前缀，
+  官方优先合并），按日期前向填充对齐；指数估值由每次刷新增量入库累积。
+- 年化波动率：**全收益指数价格**日收益 252 天滚动年化（除息平滑）
+- 最大回撤：**全收益指数价格**截至当日的滚动最大回撤（0~负值）
 - 历史分位：对每个因子做「截至当日的扩展窗口百分位」(0~100)，样本起点默认 2013-12-31
   - 股息率/利差/股息率-波动率比：值越高 → 分位越高
   - 最大回撤：越深（越负）→ 分位越高（买入信号更积极）
@@ -66,35 +66,30 @@ def _compute_max_drawdown(unit_nav: pd.Series) -> pd.Series:
     return drawdown * 100.0
 
 
-def compute_fund_factors(
-    nav_df: pd.DataFrame,
-    index_val_df: pd.DataFrame,
+def compute_index_factors(
+    index_code: str,
+    dividend_yield_df: pd.DataFrame,
+    price_df: pd.DataFrame,
     rate_df: pd.DataFrame,
     *,
-    index_price_df: pd.DataFrame | None = None,
     sample_start: str | pd.Timestamp | None = SAMPLE_START,
 ) -> pd.DataFrame:
-    """计算单只基金的完整日频因子表（口径 C：波动/回撤取指数价格）。
+    """计算指数层日频策略因子（index_daily_factors，ER 范式：因子绑定指数，多基金共用信号）。
 
-    :param nav_df: 基金净值（fund_code/nav_date/unit_nav），用于取基金代码与回退口径。
-    :param index_val_df: 底层指数估值（index_code/trade_date/dividend_yield1），
-        由 index_valuation_history 入库累积（官方）+ 推导历史合并。
-    :param rate_df: cn_10y 利率（rate_code/rate_date/rate_value）。
-    :param index_price_df: 底层指数价格（trade_date/close）。提供时，年化波动率与
-        最大回撤取【指数价格】（口径 C，与参考策略一致）；缺省回退取基金净值。
-    :param sample_start: 分位窗口样本起点（默认 2013-12-31）；None 表示用数据起点。
-    :return: fund_daily_factors 所需的 DataFrame（可按 fund_code/trade_date 入库）。
+    口径（对齐 index_daily_factors 定义）：
+    - 股息率：index_valuation_history（官方近20日 + 推导历史前缀，官方优先合并）
+    - 年化波动率 / 最大回撤：取【全收益指数】价格（除息平滑）
+    - 分位样本起点：sample_start（默认 2013-12-31）
+    :return: index_daily_factors 所需的 DataFrame（index_code/trade_date/...）
     """
-    # 基金代码（兼容：从净值表取；缺省为空字符串）
-    fund_code = ""
-    if nav_df is not None and not nav_df.empty:
-        fund_code = str(nav_df["fund_code"].iloc[0])
+    if price_df is None or price_df.empty:
+        return pd.DataFrame()
+    if dividend_yield_df is None or dividend_yield_df.empty:
+        raise ValueError("缺少指数股息率数据（index_valuation_history），无法计算策略得分。")
+    if rate_df is None or rate_df.empty:
+        raise ValueError("缺少 cn_10y 利率数据（macro_rates_history），无法计算利差。")
 
-    # 基础价格序列：指数价格优先（口径 C），否则回退基金净值
-    if index_price_df is not None and not index_price_df.empty:
-        base = index_price_df[["trade_date", "close"]].rename(columns={"close": "unit_nav"}).copy()
-    else:
-        base = nav_df[["nav_date", "unit_nav"]].rename(columns={"nav_date": "trade_date"}).copy()
+    base = price_df[["trade_date", "close"]].rename(columns={"close": "unit_nav"}).copy()
     base["trade_date"] = pd.to_datetime(base["trade_date"], errors="coerce")
     base["unit_nav"] = pd.to_numeric(base["unit_nav"], errors="coerce")
     base = (
@@ -108,88 +103,59 @@ def compute_fund_factors(
     if base.empty:
         return pd.DataFrame()
 
-    # 1) 股息率：采用底层指数股息率（dividend_yield1），按日期前向填充对齐
-    index_val = index_val_df[["trade_date", "dividend_yield1"]].copy()
-    index_val["trade_date"] = pd.to_datetime(index_val["trade_date"], errors="coerce")
-    index_val["dividend_yield1"] = pd.to_numeric(index_val["dividend_yield1"], errors="coerce")
-    index_val = index_val.dropna(subset=["trade_date", "dividend_yield1"]).sort_values("trade_date")
-    if index_val.empty:
-        raise ValueError("缺少底层指数估值数据（股息率），无法计算策略得分。请先同步 index_valuation_history。")
-    base = base.merge(
-        index_val.rename(columns={"dividend_yield1": "dividend_yield"}),
-        on="trade_date",
-        how="left",
-    )
+    # 股息率（官方+推导，前向填充对齐）
+    dy = dividend_yield_df[["trade_date", "dividend_yield"]].copy()
+    dy["trade_date"] = pd.to_datetime(dy["trade_date"], errors="coerce")
+    dy["dividend_yield"] = pd.to_numeric(dy["dividend_yield"], errors="coerce")
+    dy = dy.dropna(subset=["trade_date", "dividend_yield"]).sort_values("trade_date").drop_duplicates("trade_date")
+    base = base.merge(dy, on="trade_date", how="left")
     base["dividend_yield"] = base["dividend_yield"].ffill()
 
-    # 2) 年化波动率（基础价格日收益 252 天滚动）
+    # 年化波动率 / 最大回撤（全收益指数价格）
     daily_return = base["unit_nav"].pct_change()
-    base["annualized_vol"] = daily_return.rolling(VOL_WINDOW_DAYS).std(ddof=1) * np.sqrt(TRADING_DAYS) * 100.0
-
-    # 3) 最大回撤（基础价格截至当日的滚动回撤）
+    base["annualized_volatility"] = daily_return.rolling(VOL_WINDOW_DAYS).std(ddof=1) * np.sqrt(TRADING_DAYS) * 100.0
     base["max_drawdown"] = _compute_max_drawdown(base["unit_nav"])
 
-    # 4) 利差 = 指数股息率 - cn_10y（利率按日期前向填充对齐）
-    rate = rate_df[["rate_date", "rate_value"]].copy()
-    rate["rate_date"] = pd.to_datetime(rate["rate_date"], errors="coerce")
-    rate = rate.dropna(subset=["rate_date", "rate_value"]).sort_values("rate_date")
-    if rate.empty:
-        raise ValueError("缺少 cn_10y 利率数据，无法计算利差与策略得分。请先同步 macro_rates_history。")
-    base = base.merge(
-        rate.rename(columns={"rate_date": "trade_date", "rate_value": "cn_10y"}),
-        on="trade_date",
-        how="left",
-    )
-    base["cn_10y"] = base["cn_10y"].ffill()
-
+    # 利差 = 股息率 - cn_10y
+    rate = rate_df[["trade_date", "rate_value"]].copy()
+    rate["trade_date"] = pd.to_datetime(rate["trade_date"], errors="coerce")
+    rate["rate_value"] = pd.to_numeric(rate["rate_value"], errors="coerce")
+    rate = rate.dropna(subset=["trade_date", "rate_value"]).sort_values("trade_date").drop_duplicates("trade_date")
+    base = base.merge(rate, on="trade_date", how="left")
+    base["cn_10y"] = base["rate_value"].ffill()
     base["spread"] = base["dividend_yield"] - base["cn_10y"]
-    base["dy_vol_ratio"] = base["dividend_yield"] / base["annualized_vol"]
+    base["dy_vol_ratio"] = base["dividend_yield"] / base["annualized_volatility"]
 
-    # 5) 历史分位（扩展窗口，样本起点 sample_start）
-    base["dividend_yield_pctile"] = _expanding_percentile(base["dividend_yield"])
-    base["spread_pctile"] = _expanding_percentile(base["spread"])
-    base["dy_vol_ratio_pctile"] = _expanding_percentile(base["dy_vol_ratio"])
-    base["drawdown_pctile"] = _expanding_percentile(base["max_drawdown"], invert=True)
-    base["vol_pctile"] = _expanding_percentile(base["annualized_vol"])
+    # 历史分位（扩展窗口）
+    base["dividend_yield_percentile"] = _expanding_percentile(base["dividend_yield"])
+    base["spread_percentile"] = _expanding_percentile(base["spread"])
+    base["dy_vol_ratio_percentile"] = _expanding_percentile(base["dy_vol_ratio"])
+    base["drawdown_percentile"] = _expanding_percentile(base["max_drawdown"], invert=True)
+    base["volatility_percentile"] = _expanding_percentile(base["annualized_volatility"])
 
-    # 6) 策略得分
     a_weights = STRATEGY_A_WEIGHTS
     base["score_a"] = (
-        base["spread_pctile"] * a_weights["spread"]
-        + base["drawdown_pctile"] * a_weights["drawdown"]
-        + base["vol_pctile"] * a_weights["vol"]
+        base["spread_percentile"] * a_weights["spread"]
+        + base["drawdown_percentile"] * a_weights["drawdown"]
+        + base["volatility_percentile"] * a_weights["vol"]
     )
     b_weights = STRATEGY_B_WEIGHTS
     base["score_b"] = (
-        base["dividend_yield_pctile"] * b_weights["dividend_yield"]
-        + base["spread_pctile"] * b_weights["spread"]
-        + base["dy_vol_ratio_pctile"] * b_weights["dy_vol_ratio"]
-        + base["drawdown_pctile"] * b_weights["drawdown"]
-        + base["vol_pctile"] * b_weights["vol"]
+        base["dividend_yield_percentile"] * b_weights["dividend_yield"]
+        + base["spread_percentile"] * b_weights["spread"]
+        + base["dy_vol_ratio_percentile"] * b_weights["dy_vol_ratio"]
+        + base["drawdown_percentile"] * b_weights["drawdown"]
+        + base["volatility_percentile"] * b_weights["vol"]
     )
     base["signal_a"] = base["score_a"] >= SCORE_THRESHOLD
     base["signal_b"] = base["score_b"] >= SCORE_THRESHOLD
-    base["fund_code"] = fund_code
+    base["index_code"] = index_code
 
     columns = [
-        "fund_code",
-        "trade_date",
-        "dividend_yield",
-        "annualized_vol",
-        "max_drawdown",
-        "dividend_yield_pctile",
-        "spread",
-        "spread_pctile",
-        "dy_vol_ratio_pctile",
-        "drawdown_pctile",
-        "vol_pctile",
-        "score_a",
-        "signal_a",
-        "score_b",
-        "signal_b",
+        "index_code", "trade_date", "dividend_yield", "annualized_volatility", "max_drawdown",
+        "dividend_yield_percentile", "spread", "spread_percentile", "dy_vol_ratio_percentile",
+        "drawdown_percentile", "volatility_percentile", "score_a", "signal_a", "score_b", "signal_b",
     ]
     factors = base[columns].copy()
-
-    # 分位/得分在扩展窗口不足时可能为 NaN，跳过（保证入库字段非空）
     factors = factors.dropna(subset=["score_a", "score_b"])
     return factors.reset_index(drop=True)

@@ -42,6 +42,35 @@ def fetch_fund_nav_history(code: str) -> pd.DataFrame:
     return normalized
 
 
+def derive_adjusted_nav(nav_df: pd.DataFrame) -> pd.DataFrame:
+    """由单位净值 + 日增长率推导复权净值（红利再投资口径）。
+
+    口径（docs/基金净值数据与走势对比说明.md）：
+        adjusted_nav[t] = adjusted_nav[t-1] × (1 + daily_return[t]/100)，起点取首个 unit_nav；
+    日增长率为空/NaN 时保持前值（跳过该日）。
+
+    :param nav_df: 需含 nav_date / unit_nav / daily_return(%)
+    :return: 入参副本上增加 adjusted_nav 列（按 nav_date 升序）
+    """
+    df = nav_df.copy().sort_values("nav_date").reset_index(drop=True)
+    returns = pd.to_numeric(df.get("daily_return"), errors="coerce") / 100.0
+    unit = pd.to_numeric(df["unit_nav"], errors="coerce")
+
+    adjusted: list[float | None] = []
+    prev: float | None = None
+    for r, u in zip(returns, unit):
+        if prev is None:
+            prev = float(u) if pd.notna(u) else None
+            adjusted.append(prev)
+            continue
+        if pd.notna(r):
+            prev = prev * (1.0 + float(r))
+        adjusted.append(prev)
+
+    df["adjusted_nav"] = adjusted
+    return df
+
+
 def fetch_multiple_funds(codes: Iterable[str]) -> list[pd.DataFrame]:
     return [fetch_fund_nav_history(code) for code in codes]
 
@@ -99,6 +128,9 @@ def fetch_fund_profiles(codes: Iterable[str]) -> list[dict]:
                 first = matched.iloc[0]
                 profile["fund_name"] = str(first.get("基金简称", "")).strip()
                 profile["fund_type"] = str(first.get("基金类型", "")).strip()
+                # 场内 ETF 判定（启发式：类型含 ETF/场内 字样；当前基金均为场外 → False）
+                fund_type_upper = str(profile.get("fund_type", "")).upper()
+                profile["is_etf"] = ("ETF" in fund_type_upper) or ("场内" in fund_type_upper)
 
         try:
             info_df = ak.fund_individual_basic_info_xq(symbol=code)

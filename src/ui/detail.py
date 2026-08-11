@@ -18,6 +18,7 @@ from src.ui.charts import (
     build_dividend_history_chart,
     build_drawdown_area_chart,
     build_nav_area_chart,
+    build_performance_chart,
     build_strategy_scores_chart,
 )
 from src.ui.theme import PLOTLY_CONFIG, detail_head_html
@@ -46,6 +47,71 @@ def _render_back_and_header(code: str) -> None:
             ),
             unsafe_allow_html=True,
         )
+
+
+def _render_evaluation(code: str) -> None:
+    """🔍 基金评估：渐进式三层就绪度（数据齐到哪层出到哪层，绝不模拟/估算）。"""
+    st.divider()
+    st.subheader("🔍 基金评估")
+    ev = store.get_fund_evaluation(code)
+
+    status = ev.get("status", "blocked")
+    status_badge = {"ok": "🟢 完整", "partial": "🟡 部分", "blocked": "🔴 暂无"}.get(status, status)
+    c1, c2, c3 = st.columns([1, 2, 4])
+    with c1:
+        st.markdown(f"**状态**：{status_badge}")
+    with c2:
+        missing = ev.get("missing", [])
+        st.markdown(f"**缺失**：{'、'.join(missing) if missing else '无'}")
+    with c3:
+        st.markdown(f"**提示**：{ev.get('hint', '')}")
+
+    layers = ev.get("layers", {})
+    cols = st.columns(3)
+    for col, (key, label) in zip(cols, [("fund", "基金层"), ("index", "指数层"), ("strategy", "策略层")]):
+        with col:
+            layer = layers.get(key)
+            if layer and layer.get("available"):
+                st.success(f"**{label}**：✅ 可用")
+                detail_text = _layer_detail_text(key, layer)
+                if detail_text:
+                    st.caption(detail_text)
+            else:
+                st.info(f"**{label}**：⬜ 暂无数据")
+
+
+def _layer_detail_text(key: str, layer: dict) -> str:
+    """分层就绪度的可读摘要（全部来自真实数据量，不模拟）。"""
+    if key == "fund":
+        return (
+            f"净值 {layer.get('nav_rows', 0)} 条 · 分红 {layer.get('dividend_rows', 0)} 条"
+            f" · {layer.get('start_date', '?')} ~ {layer.get('end_date', '?')}"
+        )
+    if key == "index":
+        return (
+            f"指数行情 {layer.get('price_rows', 0)} 条"
+            f" · {layer.get('start_date', '?')} ~ {layer.get('end_date', '?')}"
+        )
+    if key == "strategy":
+        return (
+            f"指数 {layer.get('price_rows', 0)} 条 · 股息率 {layer.get('dy_rows', 0)} 条"
+            f" · PE {layer.get('pe_rows', 0)} 条 · 利率 {layer.get('rate_rows', 0)} 条"
+        )
+    return ""
+
+
+def _render_performance_chart(nav_df: pd.DataFrame) -> None:
+    """业绩走势折线图：复权净值累计收益率（%）时间序列，随上方「时间范围」胶囊联动。
+
+    分红基金（008163 每月分红）必须用复权净值，单位净值会严重低估收益；
+    区间首日归一化为 0%，与累计收益率口径类似，但按复权净值计算。
+    """
+    st.caption("业绩走势（复权净值累计收益率 %，随上方时间范围联动）")
+    st.plotly_chart(
+        build_performance_chart(nav_df),
+        width="stretch",
+        config=PLOTLY_CONFIG,
+    )
 
 
 def _render_strategy_signal(code: str) -> None:
@@ -111,13 +177,13 @@ def _render_strategy_signal(code: str) -> None:
         st.markdown("**策略指标变化趋势（A/B 得分）**")
         st.plotly_chart(build_strategy_scores_chart(factors), width="stretch", config=PLOTLY_CONFIG)
 
-    # ---------- 策略回测概览（默认不计算，按钮触发；先算策略指标后才能算回测） ----------
+    # ---------- 策略回测占位（字段保留，功能未接入：真实回测引擎见 strategy_backtest.py） ----------
     st.divider()
     st.subheader("🧪 策略回测")
     backtest_key = f"strategy_backtest_{code}"
     if not st.session_state.get(backtest_key, False):
-        st.caption("策略回测默认不计算，计算较耗时。点击下方按钮开始计算，计算后展示回测结果。")
-        if st.button("🧪 计算策略回测", type="primary"):
+        st.caption("策略回测功能暂未接入，字段先保留。")
+        if st.button("🧪 计算策略回测"):
             st.session_state[backtest_key] = True
             st.rerun()
         return
@@ -129,7 +195,8 @@ def _render_strategy_signal(code: str) -> None:
         c2.metric("组合最大回撤", f'{bt["max_drawdown_pct"]:.1f}%')
         c3.metric("信号触发", f'{bt["buy_count"]} 次')
         c4.metric("回测区间", str(bt["period"]))
-        st.caption("说明：回测为模拟数值，仅用于展示 UI；真实回测请参考 `src/indicators/strategy_backtest.py`。")
+    else:
+        st.info("暂无回测数据（回测功能待接入，不提供模拟数值）。")
 
 
 def _render_dividends(code: str) -> None:
@@ -156,6 +223,9 @@ def render() -> None:
     _render_back_and_header(code)
     st.markdown("<br>", unsafe_allow_html=True)
 
+    # ---------- 基金评估（渐进式三层就绪度） ----------
+    _render_evaluation(code)
+
     # ---------- 时间范围胶囊（联动下方所有图表与指标） ----------
     range_key = st.segmented_control(
         "时间范围",
@@ -167,6 +237,9 @@ def render() -> None:
 
     nav_df = store.get_nav_history(code, range_key=range_key)
     benchmark_df = store.get_benchmark(range_key=range_key)
+
+    # ---------- 业绩走势折线图（复权净值累计收益率，随时间范围联动） ----------
+    _render_performance_chart(nav_df)
 
     # ---------- 累计收益率 vs 沪深300（主图） ----------
     st.divider()

@@ -63,7 +63,7 @@ def build_nav_area_chart(nav_df: pd.DataFrame) -> go.Figure:
         xaxis_title="",
         yaxis_title="单位净值",
     )
-    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3")
+    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3", tickformat="%Y-%m-%d")
     figure.update_yaxes(showgrid=True, gridcolor="#F0F1F3")
     return figure
 
@@ -77,9 +77,11 @@ def build_cumulative_vs_benchmark_chart(nav_df: pd.DataFrame, benchmark_df: pd.D
         return figure
 
     ordered = nav_df.sort_values("nav_date")
-    base = float(ordered["unit_nav"].iloc[0])
-    cum_return = (ordered["unit_nav"] / base - 1.0) * 100.0
-    direction = _series_direction(ordered)
+    # 分红基金必须用复权净值（与业绩走势、全收益基准 000300S 口径一致）；无复权时回退单位净值
+    col = "adjusted_nav" if "adjusted_nav" in ordered.columns and ordered["adjusted_nav"].notna().any() else "unit_nav"
+    base = float(ordered[col].iloc[0])
+    cum_return = (ordered[col] / base - 1.0) * 100.0
+    direction = 1 if float(ordered[col].iloc[-1]) >= base else -1
     line_color = COLOR_UP if direction >= 0 else COLOR_DOWN
 
     figure.add_trace(
@@ -120,7 +122,7 @@ def build_cumulative_vs_benchmark_chart(nav_df: pd.DataFrame, benchmark_df: pd.D
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
     )
     figure.update_yaxes(zeroline=True, zerolinecolor="#D9D9D9", gridcolor="#F0F1F3")
-    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3")
+    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3", tickformat="%Y-%m-%d")
     return figure
 
 
@@ -156,7 +158,7 @@ def build_drawdown_area_chart(nav_df: pd.DataFrame) -> go.Figure:
         yaxis_title="回撤 (%)",
     )
     figure.update_yaxes(zeroline=True, zerolinecolor="#D9D9D9", gridcolor="#F0F1F3")
-    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3")
+    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3", tickformat="%Y-%m-%d")
     return figure
 
 
@@ -236,7 +238,7 @@ def build_strategy_scores_chart(factors_df: pd.DataFrame) -> go.Figure:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
     )
     figure.update_yaxes(title_text="得分", gridcolor="#F0F1F3")
-    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3")
+    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3", tickformat="%Y-%m-%d")
     return figure
 
 
@@ -269,5 +271,50 @@ def build_dividend_history_chart(dividend_df: pd.DataFrame) -> go.Figure:
         dragmode=False,
     )
     figure.update_yaxes(title_text="累计每份分红 (元)", gridcolor="#F0F1F3")
-    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3")
+    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3", tickformat="%Y-%m-%d")
+    return figure
+
+
+def build_performance_chart(nav_df: pd.DataFrame) -> go.Figure:
+    """业绩走势折线图：复权净值累计收益率（%）时间序列，区间首日归一化为 0%。
+
+    分红基金（008163 每月分红）必须用复权净值，单位净值会严重低估收益；
+    x 轴为日期（YYYY-MM-DD），y 为复权净值累计收益率 %，红涨绿跌。
+    """
+    from src.ui.theme import COLOR_DOWN, COLOR_UP
+
+    figure = go.Figure()
+    if nav_df.empty or "adjusted_nav" not in nav_df.columns:
+        return figure
+
+    ordered = nav_df.sort_values("nav_date")
+    base = float(ordered["adjusted_nav"].iloc[0])
+    if not base:
+        return figure
+    cum_return = (ordered["adjusted_nav"] / base - 1.0) * 100.0
+    direction = 1 if float(ordered["adjusted_nav"].iloc[-1]) >= base else -1
+    color = COLOR_UP if direction >= 0 else COLOR_DOWN
+
+    figure.add_trace(
+        go.Scatter(
+            x=ordered["nav_date"],
+            y=cum_return,
+            mode="lines",
+            name="业绩走势",
+            line=dict(color=color, width=2.2),
+            fill="tozeroy",
+            fillcolor=_hex_with_alpha(color, 0.08),
+            hovertemplate="%{x|%Y-%m-%d}<br>累计收益：%{y:.2f}%<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        template="plotly_white",
+        height=220,
+        margin=dict(l=10, r=10, t=30, b=10),
+        hovermode="x unified",
+        dragmode=False,
+        yaxis_title="累计收益率 (%)",
+    )
+    figure.update_yaxes(zeroline=True, zerolinecolor="#D9D9D9", gridcolor="#F0F1F3")
+    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3", tickformat="%Y-%m-%d")
     return figure
