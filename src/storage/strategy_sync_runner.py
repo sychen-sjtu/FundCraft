@@ -38,6 +38,8 @@ from src.storage.supabase_store import (
     delete_stale_fund_tracking_index,
     delete_stale_index_master,
     insert_sync_log,
+    list_fund_profiles,
+    list_watermarks,
     upsert_fund_dividends,
     upsert_fund_profiles,
     upsert_fund_tracking_index,
@@ -47,6 +49,33 @@ from src.storage.supabase_store import (
     upsert_nav_history,
     upsert_watermark,
 )
+
+class SyncProgress:
+    """轻量进度跟踪：不绑定 UI 框架，由调用方提供 reporter 回调。
+
+    reporter(done, total, label) 由 UI（如 Streamlit 进度条）实现；
+    CLI / 无 UI 调用时传 None 即静默。
+    """
+
+    __slots__ = ("total", "done", "_reporter")
+
+    def __init__(self, total: int, reporter=None) -> None:
+        self.total = max(total, 1)
+        self.done = 0
+        self._reporter = reporter
+
+    def report(self, done: int, label: str) -> None:
+        """绝对进度：直接把 done 设到指定值（用于层间跳转 / 锁定边界）。"""
+        self.done = max(0, min(done, self.total))
+        if self._reporter:
+            self._reporter(self.done, self.total, label)
+
+    def step(self, label: str, n: int = 1) -> None:
+        """步进进度：完成 n 步并上报。"""
+        self.done = min(self.done + n, self.total)
+        if self._reporter:
+            self._reporter(self.done, self.total, label)
+
 
 def sync_config(client) -> dict:
     """从 TOML 配置同步「指数注册表 + 基金→指数映射」到库。
@@ -80,30 +109,95 @@ def sync_config(client) -> dict:
     }
 
 
-def _refresh_funds(client, fund_codes: list[str]) -> list[dict]:
-    """基金层：净值(复权) + 分红 + 档案 + 水位。"""
+# 增量拉取的日期余量（天）：从「水位最新日期 - 余量」起补拉，覆盖边界日与数据修正。
+OVERLAP_DAYS = 10
+
+
+def _watermark_map(client) -> dict[tuple[str, str], pd.Timestamp]:
+    """读取同步水位：{(entity_type, entity_code): last_date}。"""
+    wm = list_watermarks(client)
+    result: dict[tuple[str, str], pd.Timestamp] = {}
+    if wm.empty:
+        return result
+    for row in wm.itertuples(index=False):
+        result[(str(row.entity_type), str(row.entity_code))] = pd.Timestamp(row.last_date)
+    return result
+
+
+def _since_date(wm: dict, key: tuple[str, str]) -> str | None:
+    """增量拉取起点 = 水位 - OVERLAP_DAYS（ISO 日期）；无水位返回 None（全量拉取）。"""
+    last = wm.get(key)
+    if last is None:
+        return None
+    return (last - pd.Timedelta(days=OVERLAP_DAYS)).date().isoformat()
+
+
+def _refresh_funds(client, fund_codes: list[str], progress: SyncProgress | None = None) -> list[dict]:
+    """基金层：净值(复权) + 分红 + 档案 + 水位。
+
+    增量策略（数据为空 → 全量；非空 → 从「水位 - OVERLAP_DAYS」起补拉）：
+    - 净值：接口只能返回全历史，但只 upsert 水位之后的行（减少写量）。
+    - 分红：全部基金合并一次抓取，起始年份从水位回退 1 年，避免逐基金重复全市场扫描。
+    - 档案：静态数据，档案表里已存在的基金不重复抓取（避免重复下载全市场列表 / 雪球逐只查询）。
+    """
     from src.fetchers.akshare_fund_nav import derive_adjusted_nav
 
     results: list[dict] = []
+    wm = _watermark_map(client)
+
+    # ---- 净值（每只；接口全历史，但只写增量行） ----
     for code in fund_codes:
+        if progress:
+            progress.step(f"基金 {code}：净值 / 复权")
         try:
             nav = derive_adjusted_nav(fetch_fund_nav_history(code))
-            upsert_nav_history(client, nav)
-            div = fetch_fund_dividends_ak([code])
-            upsert_fund_dividends(client, div)
-            upsert_fund_profiles(client, fetch_fund_profiles([code]))
+            since = _since_date(wm, ("fund", code))
+            n = upsert_nav_history(client, nav, since_date=since)
             if not nav.empty and "nav_date" in nav.columns:
                 upsert_watermark(client, "fund", code, nav["nav_date"].max(), source="fund_open_fund_info_em")
-            results.append({"entity": "fund", "fund_code": code, "nav_rows": len(nav), "dividend_rows": len(div)})
+            results.append({"entity": "fund", "fund_code": code, "nav_rows": n})
         except Exception as exc:  # noqa: BLE001
             results.append({"entity": "fund", "fund_code": code, "error": str(exc)})
+
+    # ---- 分红（合并一次抓取；起始年份按水位回退 1 年，空则 2015 起全量） ----
+    if progress:
+        progress.step(f"分红：{len(fund_codes)} 只基金合并抓取")
+    try:
+        years = [wm.get(("fund", code)).year for code in fund_codes if wm.get(("fund", code)) is not None]
+        start_year = max(2015, min(years) - 1) if years else 2015
+        div = fetch_fund_dividends_ak(fund_codes, start_year=start_year)
+        n_div = upsert_fund_dividends(client, div)
+        if n_div:
+            results.append({"entity": "dividends", "fund_codes": list(fund_codes), "dividend_rows": n_div})
+    except Exception as exc:  # noqa: BLE001
+        results.append({"entity": "dividends", "error": str(exc)})
+
+    # ---- 档案（仅缺档基金抓取；静态数据不重复拉） ----
+    try:
+        existing: set[str] = set()
+        profiles_df = list_fund_profiles(client)
+        if not profiles_df.empty and "fund_code" in profiles_df.columns:
+            existing = {str(code) for code in profiles_df["fund_code"].dropna()}
+        missing = [code for code in fund_codes if normalize_fund_code(code) not in existing]
+        if missing:
+            if progress:
+                progress.step(f"档案：{len(missing)} 只基金补抓")
+            upsert_fund_profiles(client, fetch_fund_profiles(missing))
+        results.append({"entity": "profiles", "fetched": missing, "skipped": [c for c in fund_codes if c not in missing]})
+    except Exception as exc:  # noqa: BLE001
+        results.append({"entity": "profiles", "error": str(exc)})
+
     return results
 
 
-def _refresh_rate(client) -> list[dict]:
-    """宏观层：cn_10y + 水位。"""
+def _refresh_rate(client, progress: SyncProgress | None = None) -> list[dict]:
+    """宏观层：cn_10y + 水位（增量：从「水位 - OVERLAP_DAYS」起拉，空则全量）。"""
+    if progress:
+        progress.step("宏观层：cn_10y 利率")
     try:
-        rate = fetch_cn_10y_rate()
+        since = _since_date(_watermark_map(client), ("rate", "cn_10y"))
+        start = since.replace("-", "") if since else "20000101"
+        rate = fetch_cn_10y_rate(start_date=start)
         n = upsert_macro_rates(client, rate)
         if not rate.empty and "rate_date" in rate.columns:
             upsert_watermark(client, "rate", "cn_10y", rate["rate_date"].max(), source="bond_zh_us_rate")
@@ -112,16 +206,23 @@ def _refresh_rate(client) -> list[dict]:
         return [{"entity": "rate", "error": str(exc)}]
 
 
-def _refresh_indexes(client, registry) -> list[dict]:
-    """指数层-行情：价格/全收益日行情 + 水位（000300S 用 H00300 拉取）。"""
+def _refresh_indexes(client, registry, progress: SyncProgress | None = None) -> list[dict]:
+    """指数层-行情：价格/全收益日行情 + 水位（000300S 用 H00300 拉取）。
+
+    增量：从「该指数水位 - OVERLAP_DAYS」起拉，空则全量。
+    """
     from src.fetchers.index_valuation_fetcher import fetch_index_daily_history
     from src.storage.supabase_store import upsert_index_daily_history
 
     symbol_map = {"000300S": "H00300"}
     results: list[dict] = []
+    wm = _watermark_map(client)
     for index_code in sorted(registry.keys()):
+        if progress:
+            progress.step(f"指数 {index_code}：日行情")
         try:
-            df = fetch_index_daily_history(symbol_map.get(index_code, index_code))
+            since = _since_date(wm, ("index", index_code))
+            df = fetch_index_daily_history(symbol_map.get(index_code, index_code), start_date=since or "20000101")
             if not df.empty:
                 df["index_code"] = index_code
                 n = upsert_index_daily_history(client, df)
@@ -133,14 +234,23 @@ def _refresh_indexes(client, registry) -> list[dict]:
     return results
 
 
-def _refresh_valuation(client, index_codes: tuple[str, ...] = ("H30269", "000300")) -> list[dict]:
-    """指数层-估值：官方近20日累积 + 推导历史前缀（source 标注）。"""
+def _refresh_valuation(
+    client, progress: SyncProgress | None = None, index_codes: tuple[str, ...] = ("H30269", "000300")
+) -> list[dict]:
+    """指数层-估值：官方近20日累积 + 推导历史前缀（source 标注）。
+
+    增量：官方近 20 日每次都拉（数据量小）；推导前缀（H30269 需全量重拉 H30269/H20269，较重）
+    只在「无推导数据 或 已覆盖落后官方起点 30 天以上」时重算，已覆盖则跳过。
+    """
     import akshare as _ak
 
     from src.fetchers.index_valuation_fetcher import derive_index_dividend_yield
+    from src.storage.supabase_store import _fetch_all_rows
 
     results: list[dict] = []
     for index_code in index_codes:
+        if progress:
+            progress.step(f"指数 {index_code}：估值")
         try:
             official_raw = _ak.stock_zh_index_value_csindex(symbol=index_code)
             if official_raw is not None and not official_raw.empty:
@@ -155,21 +265,35 @@ def _refresh_valuation(client, index_codes: tuple[str, ...] = ("H30269", "000300
                 upsert_index_valuations(client, official, source="csindex")
                 results.append({"entity": "valuation", "index_code": index_code, "official_rows": len(official)})
 
-                # 推导前缀（只补官方之前，source='derived'）
+                # 推导前缀（只补官方之前，source='derived'）——增量已覆盖则跳过
                 if index_code == "H30269":
-                    derived = derive_index_dividend_yield(index_code)
-                    if not derived.empty:
-                        prefix = derived[derived["trade_date"] < official["trade_date"].min()].copy()
-                        prefix = prefix.rename(columns={"dividend_yield1": "dividend_yield"})
-                        prefix["index_code"] = index_code
-                        n_derived = upsert_index_valuations(client, prefix, source="derived")
-                        results.append({"entity": "valuation", "index_code": index_code, "derived_rows": n_derived})
+                    official_min = official["trade_date"].min()
+                    derived_max = None
+                    rows = _fetch_all_rows(
+                        client.table("index_valuation_history")
+                        .select("trade_date")
+                        .eq("index_code", "H30269")
+                        .eq("source", "derived")
+                        .order("trade_date", desc=True)
+                        .limit(1)
+                    )
+                    if rows:
+                        derived_max = pd.Timestamp(rows[0]["trade_date"])
+                    need_derived = derived_max is None or derived_max < official_min - pd.Timedelta(days=30)
+                    if need_derived:
+                        derived = derive_index_dividend_yield(index_code)
+                        if not derived.empty:
+                            prefix = derived[derived["trade_date"] < official_min].copy()
+                            prefix = prefix.rename(columns={"dividend_yield1": "dividend_yield"})
+                            prefix["index_code"] = index_code
+                            n_derived = upsert_index_valuations(client, prefix, source="derived")
+                            results.append({"entity": "valuation", "index_code": index_code, "derived_rows": n_derived})
         except Exception as exc:  # noqa: BLE001
             results.append({"entity": "valuation", "index_code": index_code, "error": str(exc)})
     return results
 
 
-def _refresh_factors(client) -> list[dict]:
+def _refresh_factors(client, progress: SyncProgress | None = None) -> list[dict]:
     """策略层：指数日频因子重算（波动/回撤取全收益 H20269）。"""
     from src.indicators.strategy_factors import compute_index_factors
     from src.storage.supabase_store import (
@@ -178,6 +302,8 @@ def _refresh_factors(client) -> list[dict]:
         upsert_index_daily_factors,
     )
 
+    if progress:
+        progress.step("策略层：指数日频因子重算")
     try:
         dy_df = pd.DataFrame(
             _fetch_all_rows(client.table("index_valuation_history").select("trade_date,dividend_yield").eq("index_code", "H30269"))
@@ -203,25 +329,44 @@ def _refresh_factors(client) -> list[dict]:
         return [{"entity": "factors", "index_code": "H30269", "error": str(exc)}]
 
 
-def refresh_all(client) -> list[dict]:
+def refresh_all(client, progress: SyncProgress | None = None) -> list[dict]:
     """新 ER 结构完整刷新（UI「刷新数据」按钮用）。
 
     顺序：配置 → 基金(档案/净值/分红) → cn_10y → 指数行情(价格+全收益) → 指数估值(官方+推导) → 策略因子。
+
+    :param progress: 可选进度对象（SyncProgress 或 None）；CLI/无 UI 调用时传 None 即静默。
     """
     results: list[dict] = []
+    fund_codes = [normalize_fund_code(code) for code in load_fund_codes()]
+    registry = load_index_registry()
+    valuation_codes = ("H30269", "000300")
+    # 基金层步数 = 每只基金净值 + 分红合并 1 步 + 档案 1 步
+    total = 1 + (len(fund_codes) + 2) + 1 + len(registry) + len(valuation_codes) + 1
+    tracker = progress if isinstance(progress, SyncProgress) else SyncProgress(total, progress)
+    tracker.report(0, "准备同步…")
+
+    tracker.report(0, "① 同步配置（指数注册表 / 基金→指数映射）")
     try:
         results.append(sync_config(client))
     except Exception as exc:  # noqa: BLE001
         results.append({"entity": "config", "error": str(exc)})
 
-    fund_codes = [normalize_fund_code(code) for code in load_fund_codes()]
-    registry = load_index_registry()
+    tracker.report(1, "② 基金层：净值 / 分红 / 档案")
+    results += _refresh_funds(client, fund_codes, tracker)
 
-    results += _refresh_funds(client, fund_codes)
-    results += _refresh_rate(client)
-    results += _refresh_indexes(client, registry)
-    results += _refresh_valuation(client)
-    results += _refresh_factors(client)
+    tracker.report(1 + len(fund_codes) + 2, "③ 宏观层：cn_10y 利率")
+    results += _refresh_rate(client, tracker)
+
+    tracker.report(2 + len(fund_codes) + 2, "④ 指数层：价格 / 全收益行情")
+    results += _refresh_indexes(client, registry, tracker)
+
+    tracker.report(2 + len(fund_codes) + 2 + len(registry), "⑤ 指数层：估值（官方 + 推导）")
+    results += _refresh_valuation(client, tracker, index_codes=valuation_codes)
+
+    tracker.report(total - 1, "⑥ 策略层：指数日频因子")
+    results += _refresh_factors(client, tracker)
+
+    tracker.report(total, "同步完成")
 
     insert_sync_log(
         client,
@@ -236,25 +381,38 @@ def refresh_all(client) -> list[dict]:
 LAYER_KEYS = ("fund", "index", "rate", "factors")
 
 
-def refresh_layer(client, layer_key: str) -> tuple[list[dict], str | None]:
+def refresh_layer(client, layer_key: str, progress: SyncProgress | None = None) -> tuple[list[dict], str | None]:
     """按层刷新（UI「按层刷新」按钮用），返回 (结果列表, 错误信息)。
 
     - fund → 基金净值/分红/档案（同步水位补齐）
     - rate → cn_10y 利率
     - index → 指数行情 + 估值（官方+推导）
     - factors → 策略因子重算
+
+    :param progress: 可选进度对象（SyncProgress 或 None）；CLI/无 UI 调用时传 None 即静默。
     """
     layer_key = (layer_key or "").lower()
     if layer_key == "fund":
         fund_codes = [normalize_fund_code(code) for code in load_fund_codes()]
-        results = _refresh_funds(client, fund_codes)
+        tracker = SyncProgress(len(fund_codes) + 2, progress)
+        tracker.report(0, f"基金层：共 {len(fund_codes)} 只基金")
+        results = _refresh_funds(client, fund_codes, tracker)
     elif layer_key == "rate":
-        results = _refresh_rate(client)
+        tracker = SyncProgress(1, progress)
+        tracker.report(0, "宏观层：cn_10y 利率")
+        results = _refresh_rate(client, tracker)
     elif layer_key == "index":
         registry = load_index_registry()
-        results = _refresh_indexes(client, registry) + _refresh_valuation(client)
+        valuation_codes = ("H30269", "000300")
+        tracker = SyncProgress(len(registry) + len(valuation_codes), progress)
+        tracker.report(0, "指数层：日行情")
+        results = _refresh_indexes(client, registry, tracker)
+        tracker.report(len(registry), "指数层：估值（官方 + 推导）")
+        results += _refresh_valuation(client, tracker, index_codes=valuation_codes)
     elif layer_key == "factors":
-        results = _refresh_factors(client)
+        tracker = SyncProgress(1, progress)
+        tracker.report(0, "策略层：指数日频因子重算")
+        results = _refresh_factors(client, tracker)
     else:
         return [], f"未知数据层：{layer_key}"
 

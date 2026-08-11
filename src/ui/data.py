@@ -27,12 +27,24 @@ def _status_badge(status: str) -> str:
 
 
 def _run_refresh(full: bool) -> None:
-    """执行真实刷新（增量按水位补齐；全量先清水位重拉）。"""
-    with st.spinner("正在同步数据并重算派生因子，请稍候..."):
-        results, error = store.run_refresh(full=full)
+    """执行真实刷新（增量按水位补齐；全量先清水位重拉），带实时进度条。"""
+    mode = "全量" if full else "增量"
+    with st.status(f"⏳ {mode}刷新进行中…", expanded=True) as status:
+        progress_bar = st.progress(0.0, text="准备中…")
+
+        def _on_progress(done: int, total: int, label: str) -> None:
+            progress_bar.progress(done / total, text=f"{label}（{done}/{total}）")
+            status.update(label=f"{mode}刷新：{label}")
+
+        results, error = store.run_refresh(full=full, progress_callback=_on_progress)
+        progress_bar.empty()
+        if error:
+            status.update(label=f"❌ {mode}刷新失败", state="error")
+        else:
+            status.update(label=f"✅ {mode}刷新完成", state="complete")
     st.session_state["refresh_results"] = results
     st.session_state["refresh_error"] = error
-    st.session_state["refresh_msg"] = f"{'全量' if full else '增量'}刷新完成"
+    st.session_state["refresh_msg"] = f"{mode}刷新完成"
     st.rerun()
 
 
@@ -111,9 +123,7 @@ def _render_management_actions() -> None:
                 key=f"layer_{layer['key']}",
                 use_container_width=True,
             ):
-                _, error = store.run_layer_refresh(layer["key"])
-                st.session_state["layer_refresh_result"] = error or "完成"
-                st.rerun()
+                _run_layer_refresh(layer)
 
     # ---------- 结果 / 消息 ----------
     error = st.session_state.get("refresh_error")
@@ -134,6 +144,26 @@ def _render_management_actions() -> None:
                     st.error(str(item))
                 else:
                     st.write(str(item))
+
+
+def _run_layer_refresh(layer: dict) -> None:
+    """按层刷新（带实时进度条）。"""
+    label = f'{layer["icon"]} {layer["label"]}'
+    with st.status(f"⏳ {label}刷新中…", expanded=True) as status:
+        progress_bar = st.progress(0.0, text="准备中…")
+
+        def _on_progress(done: int, total: int, step_label: str) -> None:
+            progress_bar.progress(done / total, text=f"{step_label}（{done}/{total}）")
+            status.update(label=f"{label}：{step_label}")
+
+        _, error = store.run_layer_refresh(layer["key"], progress_callback=_on_progress)
+        progress_bar.empty()
+        if error:
+            status.update(label=f"❌ {label}失败", state="error")
+        else:
+            status.update(label=f"✅ {label}完成", state="complete")
+    st.session_state["layer_refresh_result"] = error or "完成"
+    st.rerun()
 
 
 def _render_sync_jobs() -> None:

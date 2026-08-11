@@ -27,10 +27,13 @@ from src.config import (
     load_factor_fund_codes,
     load_fund_categories,
     load_fund_codes,
+    load_index_registry,
+    load_market_index_codes,
     load_supabase_settings,
     supabase_settings_ready,
 )
 from src.indicators.evaluation import evaluate_fund
+from src.indicators.fund_metrics import build_drawdown_series
 from src.storage.supabase_store import (
     _fetch_all_rows,
     create_supabase_client,
@@ -228,6 +231,148 @@ def get_latest_nav(code: str) -> dict:
     }
 
 
+def _attach_cumulative_nav(frame: pd.DataFrame, dividends: pd.DataFrame) -> pd.DataFrame:
+    """在净值明细上追加累计净值列（= 单位净值 + 截至当日的累计每份分红，官方口径）。
+
+    累计净值（现金分红未再投资）与天天基金口径一致，全部来自真实数据；分红为空时等于单位净值。
+    """
+    nav = frame.sort_values("nav_date").reset_index(drop=True).copy()
+    nav["nav_date"] = pd.to_datetime(nav["nav_date"], errors="coerce")
+    unit = nav["unit_nav"].astype(float)
+    if dividends is None or dividends.empty or "ex_date" not in dividends.columns:
+        nav["cumulative_nav"] = unit
+        return nav
+    div = dividends.copy()
+    div["ex_date"] = pd.to_datetime(div["ex_date"], errors="coerce")
+    div = div.dropna(subset=["ex_date", "dividend_per_unit"])
+    if div.empty:
+        nav["cumulative_nav"] = unit
+        return nav
+    div_agg = div.groupby("ex_date")["dividend_per_unit"].sum().sort_index()
+    div_dates = div_agg.index.values
+    div_vals = div_agg.values
+    nav_dates = nav["nav_date"].values
+    # 截至每个净值日的累计每份分红（ex_date <= nav_date），searchsorted 避免重复累加
+    idx = np.searchsorted(div_dates, nav_dates, side="right")
+    cum_div = np.concatenate([[0.0], np.cumsum(div_vals)])[idx]
+    nav["cumulative_nav"] = cum_div + unit.values
+    return nav
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _nav_with_cumulative(url: str, key: str, code: str, start: str | None, end: str | None) -> pd.DataFrame:
+    """净值明细（含累计净值列）：复用净值/分红缓存，内存推导累计净值。"""
+    frame = _nav_history(url, key, code, start, end)
+    if frame.empty:
+        return frame
+    return _attach_cumulative_nav(frame, _dividends(url, key, code))
+
+
+def get_nav_history_with_cumulative(code: str, range_key: str = "近1年") -> pd.DataFrame:
+    """某只基金指定范围内的净值明细（含累计净值列），供详情页历史净值表使用。"""
+    url, key = _credentials()
+    start, end = _range_bounds(range_key)
+    return _nav_with_cumulative(url, key, normalize_fund_code(code), start, end)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fund_scale(code: str) -> float | None:
+    """基金最新规模（亿元）。akshare 雪球档案真实数据；失败返回 None（界面显示「暂无」）。"""
+    try:
+        import akshare as ak
+        import re
+
+        df = ak.fund_individual_basic_info_xq(symbol=code)
+        if df is None or df.empty or "item" not in df.columns or "value" not in df.columns:
+            return None
+        info = dict(zip(df["item"].astype(str), df["value"].astype(str)))
+        for key in ("最新规模", "规模"):
+            raw = str(info.get(key, "") or "").strip()
+            if not raw:
+                continue
+            # 形如 "45.19亿" / "1.23亿元" / "456.78万" / "1.23万元"
+            match = re.search(r"([\d.]+)\s*(亿|万)(?:元)?", raw.replace(",", ""))
+            if match:
+                value = float(match.group(1))
+                return value if match.group(2) == "亿" else value / 10000.0
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def get_fund_bond_metrics(code: str) -> dict:
+    """固收+ 核心指标：历史年化收益 / 最大回撤 / 卡玛比率 / 基金年限 / 基金规模（亿元）。
+
+    年化/回撤/卡玛/年限全部来自复权净值真实数据（基金年限 = 首末净值跨度）；
+    基金规模来自 akshare 雪球档案（缓存 1 小时）。拿不到 → None（界面显示「暂无」，绝不模拟）。
+    """
+    code = normalize_fund_code(code)
+    result = {
+        "annualized_return": None,
+        "max_drawdown": None,
+        "calmar_ratio": None,
+        "fund_age_years": None,
+        "fund_scale": None,
+        "inception_year": None,
+    }
+    try:
+        nav = get_nav_history(code, "全部")
+        if nav is not None and not nav.empty:
+            ordered = nav.sort_values("nav_date").reset_index(drop=True)
+            col = "adjusted_nav" if "adjusted_nav" in ordered.columns and ordered["adjusted_nav"].notna().any() else "unit_nav"
+            first = pd.Timestamp(ordered["nav_date"].iloc[0])
+            last = pd.Timestamp(ordered["nav_date"].iloc[-1])
+            span_days = max((last - first).days, 1)
+            result["fund_age_years"] = span_days / 365.25
+            result["inception_year"] = first.year  # 年化收益的起算年份（标注用）
+
+            base = float(ordered[col].iloc[0])
+            end = float(ordered[col].iloc[-1])
+            if base and end > 0:
+                result["annualized_return"] = ((end / base) ** (365.25 / span_days) - 1.0) * 100.0
+
+            dd = build_drawdown_series(ordered, nav_col=col)
+            if not dd.empty and "drawdown_pct" in dd.columns:
+                result["max_drawdown"] = float(dd["drawdown_pct"].min())
+
+            if result["annualized_return"] is not None and result["max_drawdown"] is not None and result["max_drawdown"] < 0:
+                result["calmar_ratio"] = result["annualized_return"] / abs(result["max_drawdown"])
+
+        result["fund_scale"] = _fund_scale(code)
+    except Exception:  # noqa: BLE001 - 单基金指标失败不阻塞页面
+        pass
+    return result
+
+
+def get_funds_bond_comparison(codes: list[str]) -> pd.DataFrame:
+    """固收+ 基金核心指标对比（历史年化/近1月/近3月/最大回撤/卡玛/年限/规模）。
+
+    年化等来自 get_fund_bond_metrics（真实数据）；近1月/近3月复用总览缓存。
+    """
+    overview = get_all_funds_overview()
+    by_code = {str(r.fund_code): r for r in overview.itertuples(index=False)}
+    rows = []
+    for code in codes:
+        code = normalize_fund_code(code)
+        m = get_fund_bond_metrics(code)
+        ov = by_code.get(code)
+        rows.append(
+            {
+                "fund_code": code,
+                "fund_name": str(ov.fund_name) if ov is not None else "",
+                "annualized_return": m["annualized_return"],
+                "inception_year": m["inception_year"],
+                "max_drawdown": m["max_drawdown"],
+                "calmar_ratio": m["calmar_ratio"],
+                "fund_scale": m["fund_scale"],
+                "fund_age_years": m["fund_age_years"],
+                "return_1m": getattr(ov, "return_1m", None) if ov is not None else None,
+                "return_3m": getattr(ov, "return_3m", None) if ov is not None else None,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _compute_period_returns_from(frame: pd.DataFrame, periods: list[str]) -> dict[str, float | None]:
     ordered = frame.sort_values("nav_date").reset_index(drop=True)
     result: dict[str, float | None] = {}
@@ -363,9 +508,24 @@ def get_market_indexes() -> list[dict]:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _market_indexes(url: str, key: str) -> list[dict]:
+    """市场指数条：展示 TOML [ui.market_indexes].codes 配置的指数最新行情。
+
+    名称优先取 [indexes.registry] 注册名；无行情数据时返回 None（界面显示「暂无」），
+    绝不模拟数值。
+    """
     client = _client_for(url, key)
+    registry = load_index_registry(PROJECT_ROOT)
+    codes = load_market_index_codes(PROJECT_ROOT)
+    fallback_names = {
+        "000001": "上证指数",
+        "000300": "沪深300",
+        "399001": "深证成指",
+        "399006": "创业板指",
+    }
     result = []
-    for code, name in (("000001", "上证指数"), ("000300", "沪深300")):
+    for code in codes:
+        spec = registry.get(code)
+        name = (spec.index_name if spec and spec.index_name else "") or fallback_names.get(code, code)
         rows = _fetch_all_rows(
             client.table("index_daily_history")
             .select("close,change_pct")
@@ -375,17 +535,26 @@ def _market_indexes(url: str, key: str) -> list[dict]:
         )
         if rows:
             row = rows[0]
-            result.append({"name": name, "value": float(row["close"]), "change_pct": float(row.get("change_pct") or 0.0)})
+            result.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "value": float(row["close"]),
+                    "change_pct": float(row.get("change_pct") or 0.0),
+                }
+            )
+        else:
+            result.append({"code": code, "name": name, "value": None, "change_pct": None})
     return result
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=16)
 @st.cache_data(ttl=300, show_spinner=False)
-def _benchmark_frame(url: str, key: str) -> pd.DataFrame:
-    """沪深300 全收益指数（000300S）真实走势，用于归一化对比。"""
+def _benchmark_frame(url: str, key: str, index_code: str = "000300S") -> pd.DataFrame:
+    """指定大盘指数（默认沪深300全收益 000300S）真实走势，用于归一化对比。"""
     client = _client_for(url, key)
     rows = _fetch_all_rows(
-        client.table("index_daily_history").select("trade_date,close").eq("index_code", "000300S")
+        client.table("index_daily_history").select("trade_date,close").eq("index_code", index_code)
     )
     frame = pd.DataFrame(rows) if rows else pd.DataFrame()
     if not frame.empty:
@@ -398,6 +567,18 @@ def get_benchmark(range_key: str = "近1年") -> pd.DataFrame:
     """沪深300 全收益基准序列（真实数据 000300S）。"""
     url, key = _credentials()
     frame = _benchmark_frame(url, key)
+    if frame.empty:
+        return frame
+    start, _ = _range_bounds(range_key)
+    if start is not None:
+        frame = frame[frame["nav_date"] >= pd.Timestamp(start)]
+    return frame.reset_index(drop=True)
+
+
+def get_index_benchmark(index_code: str, range_key: str = "近1年") -> pd.DataFrame:
+    """指定大盘指数的真实走势（供业绩走势对比下拉框），按范围裁剪。"""
+    url, key = _credentials()
+    frame = _benchmark_frame(url, key, str(index_code).strip())
     if frame.empty:
         return frame
     start, _ = _range_bounds(range_key)
@@ -566,12 +747,14 @@ def _invalidate_caches() -> None:
     """刷新后清理相关缓存，立即展示新数据。"""
     for func in (
         _nav_history,
+        _nav_with_cumulative,
         _fund_profiles,
         _dividends,
         _strategy_factors,
         _sync_jobs,
         _watermarks,
         _all_funds_overview,
+        _market_indexes,
     ):
         try:
             func.clear()
@@ -579,10 +762,11 @@ def _invalidate_caches() -> None:
             pass
 
 
-def run_refresh(full: bool = False) -> tuple[list[dict], str | None]:
+def run_refresh(full: bool = False, progress_callback=None) -> tuple[list[dict], str | None]:
     """执行一次真实刷新。
 
     :param full: True 时先清空水位，强制全量重拉原始数据并重算因子。
+    :param progress_callback: 可选进度回调（done, total, label），用于界面进度条。
     :return: (结果列表, 错误信息)；错误信息为 None 表示整体成功（可能含单项 error）。
     """
     try:
@@ -593,7 +777,7 @@ def run_refresh(full: bool = False) -> tuple[list[dict], str | None]:
         # 惰性导入：刷新编排较重（含 akshare 抓取链），避免在页面启动时加载
         from src.storage.strategy_sync_runner import refresh_all
 
-        results = refresh_all(client)
+        results = refresh_all(client, progress=progress_callback)
         _invalidate_caches()
         return results, None
     except Exception as exc:  # noqa: BLE001
@@ -655,10 +839,11 @@ def get_refresh_layers() -> list[dict]:
     return layers
 
 
-def run_layer_refresh(layer_key: str) -> tuple[list[dict], str | None]:
+def run_layer_refresh(layer_key: str, progress_callback=None) -> tuple[list[dict], str | None]:
     """按层刷新（真实同步编排：fund/index/rate/factors 走 strategy_sync_runner.refresh_layer）。
 
     - fund / index / rate / factors → refresh_layer（拉取 + 水位）
+    :param progress_callback: 可选进度回调（done, total, label），用于界面进度条。
     """
     layer = next((x for x in REFRESH_LAYERS if x["key"] == layer_key), None)
     label = f'{layer["icon"]} {layer["label"]}' if layer else layer_key
@@ -668,7 +853,7 @@ def run_layer_refresh(layer_key: str) -> tuple[list[dict], str | None]:
         # 惰性导入：刷新编排较重（含 akshare 抓取链），避免在页面启动时加载
         from src.storage.strategy_sync_runner import refresh_layer
 
-        results, error = refresh_layer(client, layer_key)
+        results, error = refresh_layer(client, layer_key, progress=progress_callback)
         _invalidate_caches()
         return results, error or "完成"
     except Exception as exc:  # noqa: BLE001

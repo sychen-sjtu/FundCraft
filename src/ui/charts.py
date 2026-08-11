@@ -68,9 +68,21 @@ def build_nav_area_chart(nav_df: pd.DataFrame) -> go.Figure:
     return figure
 
 
-def build_cumulative_vs_benchmark_chart(nav_df: pd.DataFrame, benchmark_df: pd.DataFrame) -> go.Figure:
-    """累计收益率 vs 沪深300 基准对比（区间首日归一化为 0%）。"""
-    from src.ui.theme import CHART_COLORS, COLOR_DOWN, COLOR_UP
+def build_cumulative_vs_benchmark_chart(
+    nav_df: pd.DataFrame,
+    benchmark_df: pd.DataFrame,
+    benchmark_name: str = "沪深300",
+    show_legend: bool = True,
+) -> go.Figure:
+    """累计收益率 vs 大盘指数对比（区间首日归一化为 0%）。
+
+    主基金高亮橙（COLOR_FUND_HIGHLIGHT），对比指数中性灰细虚线（COLOR_BENCHMARK），
+    去填充、轻网格，聚焦主线。
+
+    :param benchmark_name: 对比指数显示名（图例/hover，如 沪深300 / 上证指数 / 深证成指）。
+    :param show_legend: 是否显示 Plotly 图例（页面内用图例统计条代替时传 False）。
+    """
+    from src.ui.theme import COLOR_BENCHMARK, COLOR_FUND_HIGHLIGHT
 
     figure = go.Figure()
     if nav_df.empty:
@@ -81,8 +93,6 @@ def build_cumulative_vs_benchmark_chart(nav_df: pd.DataFrame, benchmark_df: pd.D
     col = "adjusted_nav" if "adjusted_nav" in ordered.columns and ordered["adjusted_nav"].notna().any() else "unit_nav"
     base = float(ordered[col].iloc[0])
     cum_return = (ordered[col] / base - 1.0) * 100.0
-    direction = 1 if float(ordered[col].iloc[-1]) >= base else -1
-    line_color = COLOR_UP if direction >= 0 else COLOR_DOWN
 
     figure.add_trace(
         go.Scatter(
@@ -90,9 +100,7 @@ def build_cumulative_vs_benchmark_chart(nav_df: pd.DataFrame, benchmark_df: pd.D
             y=cum_return,
             mode="lines",
             name="本基金",
-            line=dict(color=line_color, width=2.2),
-            fill="tozeroy",
-            fillcolor=_hex_with_alpha(line_color, 0.08),
+            line=dict(color=COLOR_FUND_HIGHLIGHT, width=2.5),
             hovertemplate="%{x|%Y-%m-%d}<br>累计收益：%{y:.2f}%<extra></extra>",
         )
     )
@@ -106,23 +114,28 @@ def build_cumulative_vs_benchmark_chart(nav_df: pd.DataFrame, benchmark_df: pd.D
                 x=bench["nav_date"],
                 y=bench_return,
                 mode="lines",
-                name="沪深300",
-                line=dict(color=CHART_COLORS[0], width=1.6, dash="dot"),
-                hovertemplate="%{x|%Y-%m-%d}<br>沪深300：%{y:.2f}%<extra></extra>",
+                name=benchmark_name,
+                # 对比线：极淡灰、细、实线（背景化，不抢主线）
+                line=dict(color=COLOR_BENCHMARK, width=1, dash=None),
+                hovertemplate=f"%{{x|%Y-%m-%d}}<br>{benchmark_name}：%{{y:.2f}}%<extra></extra>",
             )
         )
 
     figure.update_layout(
         template="plotly_white",
-        height=240,
-        margin=dict(l=10, r=10, t=30, b=10),
+        height=220,
+        margin=dict(l=4, r=4, t=16, b=10),
         hovermode="x unified",
         dragmode=False,
-        yaxis_title="累计收益率 (%)",
+        showlegend=show_legend,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
     )
-    figure.update_yaxes(zeroline=True, zerolinecolor="#D9D9D9", gridcolor="#F0F1F3")
-    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3", tickformat="%Y-%m-%d")
+    # 左侧只显示数字刻度（密度适中 nticks=7）、0 轴基准线加深、横向网格极淡、隐藏纵向网格、左右边距最小化
+    figure.update_yaxes(
+        zeroline=True, zerolinecolor="#B0B0B0", zerolinewidth=1.2,
+        gridcolor="#F0F0F0", nticks=7,
+    )
+    figure.update_xaxes(showgrid=False, tickformat="%Y-%m-%d")
     return figure
 
 
@@ -275,13 +288,13 @@ def build_dividend_history_chart(dividend_df: pd.DataFrame) -> go.Figure:
     return figure
 
 
-def build_performance_chart(nav_df: pd.DataFrame) -> go.Figure:
+def build_performance_chart(nav_df: pd.DataFrame, show_legend: bool = True) -> go.Figure:
     """业绩走势折线图：复权净值累计收益率（%）时间序列，区间首日归一化为 0%。
 
     分红基金（008163 每月分红）必须用复权净值，单位净值会严重低估收益；
-    x 轴为日期（YYYY-MM-DD），y 为复权净值累计收益率 %，红涨绿跌。
+    x 轴为日期（YYYY-MM-DD），主基金线固定高亮橙（无论是否对比都一致）。
     """
-    from src.ui.theme import COLOR_DOWN, COLOR_UP
+    from src.ui.theme import COLOR_FUND_HIGHLIGHT
 
     figure = go.Figure()
     if nav_df.empty or "adjusted_nav" not in nav_df.columns:
@@ -292,8 +305,6 @@ def build_performance_chart(nav_df: pd.DataFrame) -> go.Figure:
     if not base:
         return figure
     cum_return = (ordered["adjusted_nav"] / base - 1.0) * 100.0
-    direction = 1 if float(ordered["adjusted_nav"].iloc[-1]) >= base else -1
-    color = COLOR_UP if direction >= 0 else COLOR_DOWN
 
     figure.add_trace(
         go.Scatter(
@@ -301,20 +312,24 @@ def build_performance_chart(nav_df: pd.DataFrame) -> go.Figure:
             y=cum_return,
             mode="lines",
             name="业绩走势",
-            line=dict(color=color, width=2.2),
+            line=dict(color=COLOR_FUND_HIGHLIGHT, width=2.5),
             fill="tozeroy",
-            fillcolor=_hex_with_alpha(color, 0.08),
+            fillcolor=_hex_with_alpha(COLOR_FUND_HIGHLIGHT, 0.04),
             hovertemplate="%{x|%Y-%m-%d}<br>累计收益：%{y:.2f}%<extra></extra>",
         )
     )
     figure.update_layout(
         template="plotly_white",
         height=220,
-        margin=dict(l=10, r=10, t=30, b=10),
+        margin=dict(l=4, r=4, t=16, b=10),
         hovermode="x unified",
         dragmode=False,
-        yaxis_title="累计收益率 (%)",
+        showlegend=show_legend,
     )
-    figure.update_yaxes(zeroline=True, zerolinecolor="#D9D9D9", gridcolor="#F0F1F3")
-    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3", tickformat="%Y-%m-%d")
+    # 左侧只显示数字刻度（密度适中 nticks=7）、0 轴基准线加深、横向网格极淡、隐藏纵向网格、左右边距最小化
+    figure.update_yaxes(
+        zeroline=True, zerolinecolor="#B0B0B0", zerolinewidth=1.2,
+        gridcolor="#F0F0F0", nticks=7,
+    )
+    figure.update_xaxes(showgrid=False, tickformat="%Y-%m-%d")
     return figure

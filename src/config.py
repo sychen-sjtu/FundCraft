@@ -191,6 +191,38 @@ def load_fund_codes(project_root: Path | None = None) -> list[str]:
     return codes
 
 
+def load_market_index_codes(project_root: Path | None = None) -> list[str]:
+    """读取我的基金页顶部市场指数条展示的指数代码（TOML [ui.market_indexes].codes）。
+
+    顺序即展示顺序；缺省回退 ["000001", "000300"]（上证指数、沪深300）。
+    """
+    root = project_root or Path(__file__).resolve().parents[1]
+    secrets = _read_streamlit_secrets(root)
+    ui = secrets.get("ui", {}) if isinstance(secrets, dict) else {}
+    codes = ui.get("market_indexes", {}).get("codes", []) if isinstance(ui, dict) else []
+    if isinstance(codes, str):
+        codes = [codes]
+    if isinstance(codes, list) and codes:
+        return [str(code).strip() for code in codes if str(code).strip()]
+    return ["000001", "000300"]
+
+
+def load_compare_index_codes(project_root: Path | None = None) -> list[str]:
+    """读取业绩走势可选对比指数（TOML [ui.compare_indexes].codes）。
+
+    顺序即下拉框选项顺序；缺省回退 ["000300S"]（沪深300全收益）。
+    """
+    root = project_root or Path(__file__).resolve().parents[1]
+    secrets = _read_streamlit_secrets(root)
+    ui = secrets.get("ui", {}) if isinstance(secrets, dict) else {}
+    codes = ui.get("compare_indexes", {}).get("codes", []) if isinstance(ui, dict) else []
+    if isinstance(codes, str):
+        codes = [codes]
+    if isinstance(codes, list) and codes:
+        return [str(code).strip() for code in codes if str(code).strip()]
+    return ["000300S"]
+
+
 # 需要计算并入库策略因子的面板类型（取代旧的 [strategy] fund_codes 配置）
 FACTOR_PANELS = frozenset({"红利低波"})
 

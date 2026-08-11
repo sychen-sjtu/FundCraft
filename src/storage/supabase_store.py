@@ -1,13 +1,32 @@
 from __future__ import annotations
 
 from datetime import datetime
+import time
 from typing import Iterable
 from uuid import uuid4
 
+import httpx
 import pandas as pd
 from supabase import Client, create_client
 
 from src.config import IndexSpec, SupabaseSettings, supabase_settings_ready
+
+
+# 传输层错误重试：网络瞬时抖动（连接/超时/断连）自动重试，业务错误（4xx/5xx）不重试
+_RETRY_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 0.6
+
+
+def _execute_with_retry(query_builder, *, attempts: int = _RETRY_ATTEMPTS):
+    """执行一次 Supabase 请求；传输层错误（httpx.RequestError）按退避重试。"""
+    for attempt in range(1, attempts + 1):
+        try:
+            return query_builder.execute()
+        except httpx.RequestError:
+            if attempt >= attempts:
+                raise
+            time.sleep(_RETRY_BASE_DELAY * attempt)
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 def normalize_fund_code(code) -> str:
@@ -17,13 +36,17 @@ def normalize_fund_code(code) -> str:
 
 
 def _fetch_all_rows(query_builder, *, page_size: int = 1000) -> list[dict]:
-    """Fetch all rows from a Supabase query using range pagination."""
+    """Fetch all rows from a Supabase query using range pagination.
+
+    传输层错误（连接/超时/断连，httpx.RequestError）自动重试，避免瞬时网络抖动
+    直接中断读取（如 UI 净值走势读取）；业务错误（4xx/5xx APIError）不重试。
+    """
     all_rows: list[dict] = []
     start = 0
 
     while True:
         end = start + page_size - 1
-        response = query_builder.range(start, end).execute()
+        response = _execute_with_retry(query_builder.range(start, end))
         page_rows = response.data or []
         if not page_rows:
             break
@@ -123,17 +146,23 @@ def delete_stale_index_master(client: Client, keep_codes: Iterable[str], *, refe
     return len(stale)
 
 
-def upsert_nav_history(client: Client, nav_df: pd.DataFrame) -> None:
+def upsert_nav_history(client: Client, nav_df: pd.DataFrame, *, since_date: str | None = None) -> int:
     """Upsert 基金净值到 fund_nav_history（新结构：trade_date / adjusted_nav）。
 
     nav_df 需含 fund_code / unit_nav，日期列兼容 nav_date 或 trade_date；
     可含 daily_return(%, 建议) 与 adjusted_nav（复权净值，建议入库前由 derive_adjusted_nav 推导）。
+
+    :param since_date: 增量写入：只写 >= 该日期（YYYY-MM-DD）的行；None 全量。
+    :return: 写入的行数。
     """
     frame = nav_df.copy()
     date_col = "trade_date" if "trade_date" in frame.columns else "nav_date"
     missing_columns = {"fund_code", date_col, "unit_nav"} - set(frame.columns)
     if missing_columns:
         raise ValueError(f"Missing required NAV columns: {sorted(missing_columns)}")
+
+    if since_date is not None and not frame.empty:
+        frame = frame[pd.to_datetime(frame[date_col], errors="coerce") >= pd.Timestamp(since_date)]
 
     records = []
     for row in frame.itertuples(index=False):
@@ -154,6 +183,7 @@ def upsert_nav_history(client: Client, nav_df: pd.DataFrame) -> None:
 
     if records:
         client.table("fund_nav_history").upsert(records, on_conflict="fund_code,trade_date").execute()
+    return len(records)
 
 
 def insert_sync_log(client: Client, *, job_name: str, status: str, message: str, row_count: int) -> None:

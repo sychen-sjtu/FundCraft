@@ -12,6 +12,7 @@ from datetime import date
 from functools import lru_cache
 
 import akshare as ak
+import numpy as np
 import pandas as pd
 
 SOURCE = "csindex"
@@ -72,10 +73,53 @@ def derive_index_dividend_yield(index_code: str, *, window_days: int = DERIVE_WI
 TOTAL_RETURN_CODES = frozenset({"H20269", "H00300", "000300S"})
 
 
-def fetch_index_daily_history(index_code: str, *, start_date: str = "20000101", end_date: str | None = None) -> pd.DataFrame:
-    """抓取指数日行情全历史（csindex 官方，须显式传起止日期）。
+def _fetch_index_daily_sina(index_code: str, *, start_date: str | None = None) -> pd.DataFrame:
+    """新浪源兜底：csindex 不收录的指数（深交所 399xxx 等）。
 
-    :return: DataFrame(index_code, trade_date, open, high, low, close, change_pct, volume, amount, index_type)
+    `ak.stock_zh_index_daily(symbol)` 返回全历史（date/open/high/low/close/volume），
+    不支持日期过滤 → 取回后按 start_date 在内存过滤；日涨跌幅由收盘价环比推导。
+    :return: 与 fetch_index_daily_history 相同列结构（source='sina'）；失败返回空 DataFrame。
+    """
+    empty = pd.DataFrame(
+        columns=["index_code", "trade_date", "open", "high", "low", "close",
+                 "change_pct", "volume", "amount", "index_type"]
+    )
+    code = str(index_code).strip()
+    symbol = ("sz" if code.startswith("399") else "sh") + code
+    try:
+        raw = ak.stock_zh_index_daily(symbol=symbol)
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARN: sina index {symbol} failed: {exc}")
+        return empty
+    if raw is None or raw.empty or "date" not in raw.columns or "close" not in raw.columns:
+        return empty
+
+    df = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(raw["date"], errors="coerce"),
+            "open": pd.to_numeric(raw["open"], errors="coerce"),
+            "high": pd.to_numeric(raw["high"], errors="coerce"),
+            "low": pd.to_numeric(raw["low"], errors="coerce"),
+            "close": pd.to_numeric(raw["close"], errors="coerce"),
+            "volume": pd.to_numeric(raw["volume"], errors="coerce"),
+        }
+    )
+    df["change_pct"] = df["close"].pct_change() * 100.0
+    df["amount"] = np.nan
+    df["index_code"] = code
+    df["index_type"] = "total_return" if code.upper() in TOTAL_RETURN_CODES else "price"
+    df["source"] = "sina"
+    if start_date:
+        df = df[df["trade_date"] >= pd.Timestamp(start_date)]
+    df = df.dropna(subset=["trade_date", "close"]).sort_values("trade_date").reset_index(drop=True)
+    return df[["index_code", "trade_date", "open", "high", "low", "close",
+               "change_pct", "volume", "amount", "index_type", "source"]]
+
+
+def fetch_index_daily_history(index_code: str, *, start_date: str = "20000101", end_date: str | None = None) -> pd.DataFrame:
+    """抓取指数日行情全历史（csindex 官方优先；csindex 不收录的指数回落新浪源）。
+
+    :return: DataFrame(index_code, trade_date, open, high, low, close, change_pct, volume, amount, index_type[, source])
     """
     end = end_date or date.today().strftime("%Y%m%d")
     # csindex 对部分代码偶发返回空，akshare 会抛 Length mismatch；加健壮处理 + 重试
@@ -88,10 +132,8 @@ def fetch_index_daily_history(index_code: str, *, start_date: str = "20000101", 
         except Exception:  # noqa: BLE001
             raw_df = None
     if raw_df is None or raw_df.empty:
-        return pd.DataFrame(
-            columns=["index_code", "trade_date", "open", "high", "low", "close",
-                     "change_pct", "volume", "amount", "index_type"]
-        )
+        # csindex 不收录（如深交所 399xxx）→ 新浪源兜底
+        return _fetch_index_daily_sina(index_code, start_date=start_date)
 
     rename = {
         "日期": "trade_date", "开盘": "open", "最高": "high", "最低": "low",
