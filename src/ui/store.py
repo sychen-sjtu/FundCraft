@@ -622,6 +622,51 @@ def get_strategy_overview(code: str) -> dict:
     }
 
 
+# ---------- RSI 动能看板（派生计算，不落库） ----------
+# 看板时间范围（周 RSI 需要较长历史，默认近 3 年，符合用户「近 3~5 年」建议）
+RSI_RANGE_OPTIONS = ["近1年", "近3年", "近5年", "全部"]
+RSI_RANGE_DAYS = {"近1年": 365, "近3年": 365 * 3, "近5年": 365 * 5}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _rsi_dashboard_full(url: str, key: str, code: str) -> dict:
+    """某基金的 RSI 看板数据（缓存）：基于【全历史】净值计算全部指标。
+
+    净值走 _nav_history（复用净值缓存）；spread 走 _strategy_factors（复用指数层因子缓存，
+    无映射基金如 008163 返回空 → 看板无利差线，其余照常计算，绝不模拟）。
+
+    **关键**：必须全历史计算后再由 slice_rsi_dashboard 按显示窗口裁剪，否则 250 日均线
+    在窗口起始处缺少一年预热数据，会形成被高起点拉偏的伪拟合线（用户反馈 Bug）。
+    """
+    nav = _nav_history(url, key, code, None, None)
+    if nav.empty:
+        return {}
+    factors = _strategy_factors(url, key, code)
+    from src.indicators.rsi import build_rsi_dashboard
+
+    return build_rsi_dashboard(nav, factors)
+
+
+def get_rsi_dashboard(code: str, range_key: str = "近3年") -> dict:
+    """某只基金 RSI 动能看板（日/周 RSI、250MA、信号、前瞻统计、股息率利差）。
+
+    基于全历史计算，再按 range_key 裁剪显示窗口（250MA/RSI/信号在窗口起始处即正确）。
+    数据纪律：全部由真实净值/指数因子派生；spread 只在该基金有策略指数映射时才有，
+    无映射基金（如 008163）对应字段为空，界面显示「暂无」，绝不模拟。
+    """
+    url, key = _credentials()
+    data = _rsi_dashboard_full(url, key, normalize_fund_code(code))
+    if not data:
+        return data
+    days = RSI_RANGE_DAYS.get(range_key)
+    if days is None:
+        return data
+    from src.indicators.rsi import slice_rsi_dashboard
+
+    start = date.today() - timedelta(days=days)
+    return slice_rsi_dashboard(data, pd.Timestamp(start))
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _fund_evaluation(url: str, key: str, code: str) -> dict:
     """带 client 的评估（缓存 5 分钟；client 来自可哈希的 url/key）。"""

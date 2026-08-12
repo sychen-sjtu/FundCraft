@@ -20,6 +20,7 @@ from src.ui.charts import (
     build_drawdown_area_chart,
     build_nav_area_chart,
     build_performance_chart,
+    build_rsi_dashboard_chart,
     build_strategy_scores_chart,
 )
 from src.ui.theme import COLOR_BENCHMARK, COLOR_FUND_HIGHLIGHT, PLOTLY_CONFIG, detail_head_html
@@ -336,6 +337,159 @@ def _render_strategy_signal(code: str) -> None:
         st.info("暂无回测数据（回测功能待接入，不提供模拟数值）。")
 
 
+# RSI 看板信号类型 → 中文标签 / 颜色（与 charts._RSI_COLORS 一致）
+_RSI_KIND_LABEL = {"A": "A 共振低吸", "B": "B 底背离", "C": "C 钝化警示"}
+_RSI_KIND_COLOR = {"A": "#00B578", "B": "#722ED1", "C": "#FA8C16"}
+_RSI_LOW, _RSI_HIGH = 35.0, 65.0
+
+
+def _rsi_zone(value) -> tuple[str, str]:
+    """RSI 分区：(文案, 颜色)。<35 低吸(绿) / 35~65 中性(灰) / >65 风险(红)。"""
+    if value is None or pd.isna(value):
+        return "—", "#8A8F99"
+    if value < _RSI_LOW:
+        return "低吸", "#00B578"
+    if value > _RSI_HIGH:
+        return "风险", "#E64A3D"
+    return "中性", "#8A8F99"
+
+
+def _rsi_kpi_html(label: str, value_text: str, zone_label: str, zone_color: str) -> str:
+    """RSI 当日指标小卡（复用 .fc-metric-today 白卡样式，底部带分区标签）。"""
+    return (
+        f'<div class="fc-metric-today">'
+        f'<div class="fc-metric-label">{label}</div>'
+        f'<div class="fc-metric-value">{value_text}</div>'
+        f'<div style="font-size:12px;margin-top:2px;color:{zone_color};font-weight:600;">{zone_label}</div>'
+        f"</div>"
+    )
+
+
+def _fwd_cell(value) -> str:
+    """前瞻收益单元格（遵循用户口径：>0 绿 / <0 红；与图3柱一致）。"""
+    if value is None or pd.isna(value):
+        return '<span class="fc-flat">—</span>'
+    color = "#00B578" if value > 0 else ("#E64A3D" if value < 0 else "#8A8F99")
+    sign = "+" if value > 0 else ""
+    return f'<span style="color:{color};font-weight:600;">{sign}{value:.1f}%</span>'
+
+
+def _render_rsi_signals_table(signals: pd.DataFrame) -> None:
+    """信号明细轻量表（最新在前，最多 12 条）：日期/模式/周RSI/日RSI/前瞻收益/60日回撤。"""
+    view = signals.sort_values("nav_date", ascending=False).head(12).reset_index(drop=True)
+    rows_html = []
+    for row in view.itertuples(index=False):
+        date = pd.Timestamp(row.nav_date).strftime("%Y-%m-%d")
+        kind = str(row.kind)
+        label = _RSI_KIND_LABEL.get(kind, kind)
+        color = _RSI_KIND_COLOR.get(kind, "#1F2329")
+        w_rsi = f"{float(row.weekly_rsi):.1f}" if pd.notna(row.weekly_rsi) else "—"
+        d_rsi = f"{float(row.daily_rsi):.1f}" if pd.notna(row.daily_rsi) else "—"
+        rows_html.append(
+            f"<tr><td>{date}</td>"
+            f"<td><span style='color:{color};font-weight:600;'>{label}</span></td>"
+            f"<td class='num'>{w_rsi}</td><td class='num'>{d_rsi}</td>"
+            f"<td class='num'>{_fwd_cell(getattr(row, 'fwd_20', None))}</td>"
+            f"<td class='num'>{_fwd_cell(getattr(row, 'fwd_60', None))}</td>"
+            f"<td class='num'>{_fwd_cell(getattr(row, 'fwd_120', None))}</td>"
+            f"<td class='num'>{_fwd_cell(getattr(row, 'mdd60', None))}</td>"
+            f"</tr>"
+        )
+    st.markdown(
+        '<div class="fc-panel-head"><span class="fc-panel-title">RSI 历史信号</span>'
+        '<span class="fc-panel-note">最新在前 · 前瞻收益=信号后交易日累计收益 · 回撤=未来60日最大回撤</span></div>'
+        '<div class="fc-nav-table-wrap"><table class="fc-nav-table">'
+        "<thead><tr><th>日期</th><th>模式</th><th class='num'>周RSI</th><th class='num'>日RSI</th>"
+        "<th class='num'>T+20</th><th class='num'>T+60</th><th class='num'>T+120</th>"
+        "<th class='num'>60日回撤</th></tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_rsi_dashboard(code: str) -> None:
+    """RSI 动能看板（红利低波专用）：三层联动图 + 当日指标卡 + 信号明细。
+
+    全部由真实复权净值派生（派生不落库）；股息率利差仅在有策略指数映射的基金显示
+    （007466→H30269 有，008163 无映射 → 该卡/线显示「暂无」，绝不模拟）。
+    """
+    st.divider()
+    with st.container(horizontal=True, key=f"rsi_head_{code}"):
+        st.markdown(
+            '<span style="font-size:13px;font-weight:700;color:#1F2329;">📊 RSI 动能看板'
+            '<span class="fc-help" data-tip="日RSI=复权净值 Wilder 平滑(6/12)；周RSI=周收盘(12/24)；'
+            '图1复权净值+250MA+历史信号，图2周/日RSI+30/35/65/70参考线（<35浅绿低吸区、>65浅红风险区）。'
+            '模式A共振低吸/模式B底背离/模式C钝化陷阱，前瞻收益见信号表。">?</span>'
+            "</span>",
+            unsafe_allow_html=True,
+        )
+        rsi_range = st.segmented_control(
+            "看板范围",
+            options=store.RSI_RANGE_OPTIONS,
+            default="近3年",
+            selection_mode="single",
+            label_visibility="collapsed",
+            key=f"rsi_range_{code}",
+        )
+
+    data = store.get_rsi_dashboard(code, rsi_range)
+    if not data or data.get("nav", pd.DataFrame()).empty:
+        st.info("暂无足够净值数据计算 RSI。")
+        return
+
+    latest = data.get("latest", {})
+    stats = data.get("stats", {})
+    signals = data.get("signals", pd.DataFrame())
+
+    # ---- 当日指标卡 ----
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        z = _rsi_zone(latest.get("rsi6"))
+        st.markdown(_rsi_kpi_html("日 RSI(6)", f'{latest["rsi6"]:.1f}' if latest.get("rsi6") is not None else "—", z[0], z[1]), unsafe_allow_html=True)
+    with c2:
+        z = _rsi_zone(latest.get("rsi12"))
+        st.markdown(_rsi_kpi_html("日 RSI(12)", f'{latest["rsi12"]:.1f}' if latest.get("rsi12") is not None else "—", z[0], z[1]), unsafe_allow_html=True)
+    with c3:
+        z = _rsi_zone(latest.get("w_rsi12"))
+        st.markdown(_rsi_kpi_html("周 RSI(12)", f'{latest["w_rsi12"]:.1f}' if latest.get("w_rsi12") is not None else "—", z[0], z[1]), unsafe_allow_html=True)
+    with c4:
+        z = _rsi_zone(latest.get("w_rsi24"))
+        st.markdown(_rsi_kpi_html("周 RSI(24)", f'{latest["w_rsi24"]:.1f}' if latest.get("w_rsi24") is not None else "—", z[0], z[1]), unsafe_allow_html=True)
+    with c5:
+        spread = latest.get("spread")
+        spread_text = f"{spread:.2f}%" if spread is not None else "暂无"
+        st.markdown(_rsi_kpi_html("股息率利差", spread_text, "", "#8A8F99"), unsafe_allow_html=True)
+
+    # ---- 当前组合判断 + 统计 ----
+    signal_text = latest.get("signal_text")
+    if signal_text:
+        st.markdown(
+            f'<div style="background:#FFFFFF;border:1px solid #EDEFF2;border-radius:10px;'
+            f'padding:9px 14px;font-size:13px;color:#1F2329;margin:8px 0;">'
+            f'<b>📌 当前判断</b>　{signal_text}</div>',
+            unsafe_allow_html=True,
+        )
+    if stats:
+        parts = []
+        if "buy_count" in stats:
+            parts.append(f"买入信号 {stats['buy_count']} 次")
+        if "win_rate_60" in stats:
+            parts.append(f"T+60 胜率 {stats['win_rate_60']:.0f}%")
+        if "avg_fwd_60" in stats:
+            parts.append(f"平均 T+60 {stats['avg_fwd_60']:+.1f}%")
+        if "avg_mdd60" in stats:
+            parts.append(f"平均 60日回撤 {stats['avg_mdd60']:.1f}%")
+        if parts:
+            st.caption(" · ".join(parts))
+
+    # ---- 三层联动主图 ----
+    st.plotly_chart(build_rsi_dashboard_chart(data), width="stretch", config=PLOTLY_CONFIG, key=f"rsi_chart_{code}")
+
+    # ---- 信号明细表 ----
+    if not signals.empty:
+        _render_rsi_signals_table(signals)
+
+
 def _render_dividends(code: str) -> None:
     """分红记录：折线图展示累计每份分红。"""
     dividend_df = store.get_dividends(code)
@@ -453,8 +607,9 @@ def render() -> None:
     with st.expander("📉 最大回撤", expanded=False):
         st.plotly_chart(build_drawdown_area_chart(nav_df), width="stretch", config=PLOTLY_CONFIG, key="drawdown_area")
 
-    # ---------- 策略信号（红利低波） ----------
+    # ---------- RSI 动能看板 + 策略信号（红利低波） ----------
     if meta["panel"] == "红利低波":
+        _render_rsi_dashboard(code)
         _render_strategy_signal(code)
 
     # ---------- 分红记录（默认折叠，折线图） ----------

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from src.indicators.fund_metrics import build_drawdown_series
 
@@ -333,3 +334,170 @@ def build_performance_chart(nav_df: pd.DataFrame, show_legend: bool = True) -> g
     )
     figure.update_xaxes(showgrid=False, tickformat="%Y-%m-%d")
     return figure
+
+
+# ---------- RSI 动能看板（两层上下联动，共享 X 轴） ----------
+# 主图/动能图信号标记配色（绿=买、紫=背离、橙=钝化警示，与用户方案一致）
+_RSI_COLORS = {"A": "#00B578", "B": "#722ED1", "C": "#FA8C16"}
+_RSI_SYMBOLS = {"A": "triangle-up", "B": "diamond", "C": "square"}
+# RSI 超买超卖区间带与参考线
+_RSI_LOW, _RSI_HIGH = 35.0, 65.0
+
+
+def build_rsi_dashboard_chart(data: dict) -> go.Figure:
+    """RSI 两层联动看板（共享 X 轴）。
+
+    图1（主图）：复权净值（黑）+ 250 日均线（蓝虚线）+ 历史信号标注
+        A 绿上箭头（强烈买入）/ B 紫菱形（底背离）/ C 橙方块（钝化警示）
+    图2（动能图）：周 RSI12（粗实线）/ 周 RSI24（灰细线）/ 日 RSI6·RSI12（半透明辅助）
+        + <35 浅绿（低吸区）/ >65 浅红（风险区）区间带 + 30/35/65/70 参考线 + 背离线（紫虚线）
+    （T+60 前瞻收益图按用户要求暂不下沉展示；前瞻统计保留在当日指标卡与信号明细表）
+
+    :param data: rsi.build_rsi_dashboard 的返回 dict（已按显示窗口裁剪）。
+    """
+    nav = data.get("nav", pd.DataFrame())
+    figure = go.Figure()
+    if nav.empty:
+        return figure
+
+    daily = data.get("daily", pd.DataFrame())
+    weekly = data.get("weekly", pd.DataFrame())
+    signals = data.get("signals", pd.DataFrame())
+    divergences = data.get("divergences", [])
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        row_heights=[0.55, 0.45],
+    )
+
+    # ---------------- 图 1：复权净值 + 250MA + 信号标注 ----------------
+    fig.add_trace(
+        go.Scatter(
+            x=nav["nav_date"], y=nav["adjusted_nav"], name="复权净值",
+            line=dict(color="#1F2329", width=2.2),
+            hovertemplate="%{x|%Y-%m-%d}<br>复权净值：%{y:.4f}<extra></extra>",
+        ),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=nav["nav_date"], y=nav["ma250"], name="250日均线",
+            line=dict(color="#1677FF", width=1.4, dash="dash"),
+            hovertemplate="%{x|%Y-%m-%d}<br>250MA：%{y:.4f}<extra></extra>",
+        ),
+        row=1, col=1,
+    )
+
+    # 信号标注（主图）
+    if not signals.empty:
+        for kind in ("A", "B", "C"):
+            sel = signals[signals["kind"] == kind]
+            if sel.empty:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=sel["nav_date"], y=sel["nav"], mode="markers",
+                    name=kind, showlegend=False,
+                    marker=dict(symbol=_RSI_SYMBOLS[kind], size=12, color=_RSI_COLORS[kind], line=dict(width=1, color="#FFFFFF")),
+                    hovertemplate="%{x|%Y-%m-%d}<br>%{customdata}<br>复权净值：%{y:.4f}<extra></extra>",
+                    customdata=sel["label"] if "label" in sel.columns else [kind] * len(sel),
+                ),
+                row=1, col=1,
+            )
+
+    # 底背离背离线（主图：价格低点连线）
+    for dv in divergences:
+        fig.add_trace(
+            go.Scatter(
+                x=[dv["price_x_prev"], dv["price_x_curr"]],
+                y=[dv["price_y_prev"], dv["price_y_curr"]],
+                mode="lines",
+                line=dict(color=_RSI_COLORS["B"], width=1.2, dash="dot"),
+                hoverinfo="skip",
+                showlegend=False,
+            ),
+            row=1, col=1,
+        )
+
+    # ---------------- 图 2：周/日 RSI 双周期 + 超买超卖带 ----------------
+    if not weekly.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=weekly["nav_date"], y=weekly["w_rsi12"], name="周RSI(12)",
+                line=dict(color="#1F2329", width=2.2),
+                hovertemplate="%{x|%Y-%m-%d}<br>周RSI(12)：%{y:.1f}<extra></extra>",
+            ),
+            row=2, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=weekly["nav_date"], y=weekly["w_rsi24"], name="周RSI(24)",
+                line=dict(color="#8A8F99", width=1.4),
+                hovertemplate="%{x|%Y-%m-%d}<br>周RSI(24)：%{y:.1f}<extra></extra>",
+            ),
+            row=2, col=1,
+        )
+    if not daily.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=daily["nav_date"], y=daily["rsi6"], name="日RSI(6)",
+                line=dict(color="#1677FF", width=1.2), opacity=0.45,
+                hovertemplate="%{x|%Y-%m-%d}<br>日RSI(6)：%{y:.1f}<extra></extra>",
+            ),
+            row=2, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=daily["nav_date"], y=daily["rsi12"], name="日RSI(12)",
+                line=dict(color="#FA8C16", width=1.2), opacity=0.45,
+                hovertemplate="%{x|%Y-%m-%d}<br>日RSI(12)：%{y:.1f}<extra></extra>",
+            ),
+            row=2, col=1,
+        )
+
+    # 底背离背离线（动能图：RSI 低点连线）
+    for dv in divergences:
+        fig.add_trace(
+            go.Scatter(
+                x=[dv["rsi_x_prev"], dv["rsi_x_curr"]],
+                y=[dv["rsi_y_prev"], dv["rsi_y_curr"]],
+                mode="lines",
+                line=dict(color=_RSI_COLORS["B"], width=1.2, dash="dot"),
+                hoverinfo="skip",
+                showlegend=False,
+            ),
+            row=2, col=1,
+        )
+
+    # 区间带/参考线必须在本子图已有 trace 之后再添加（plotly 6.7 的 add_hrect/add_hline
+    # 在目标子图尚无任何 trace 时会被静默丢弃，导致 35/65 区间带不渲染）
+    # 区间带：<35 浅绿（低吸区） / >65 浅红（风险区）
+    fig.add_hrect(y0=0, y1=_RSI_LOW, fillcolor="rgba(0,181,120,0.13)", line_width=0, row=2, col=1)
+    fig.add_hrect(y0=_RSI_HIGH, y1=100, fillcolor="rgba(230,74,61,0.13)", line_width=0, row=2, col=1)
+    # 参考线：30/70 点线（可见基准）+ 35/65 浅虚线（带边界）
+    for y in (30, 70):
+        fig.add_hline(y=y, line_dash="dot", line_color="#A6ADB8", line_width=1.2, row=2, col=1)
+    for y in (_RSI_LOW, _RSI_HIGH):
+        fig.add_hline(y=y, line_dash="dash", line_color="#C0C4CC", line_width=1, row=2, col=1)
+
+    # ---------------- 布局 ----------------
+    fig.update_layout(
+        template="plotly_white",
+        height=560,
+        margin=dict(l=8, r=8, t=30, b=8),
+        hovermode="x unified",
+        dragmode=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0, font=dict(size=11)),
+    )
+    fig.update_yaxes(
+        row=1, col=1,
+        zeroline=True, zerolinecolor="#B0B0B0", zerolinewidth=1.2,
+        gridcolor="#F0F0F0", nticks=7,
+    )
+    fig.update_yaxes(row=2, col=1, title_text="RSI", range=[0, 100], gridcolor="#F0F0F0", nticks=6)
+    fig.update_xaxes(row=1, col=1, showgrid=False, tickformat="%Y-%m-%d")
+    fig.update_xaxes(row=2, col=1, showgrid=True, gridcolor="#F0F0F0", tickformat="%Y-%m-%d")
+    return fig
