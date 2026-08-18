@@ -26,6 +26,7 @@ class FundCategory:
     fund_codes: tuple[str, ...]
     panel: str = "净值"
     index_codes: dict[str, str] = field(default_factory=dict)  # 基金代码 -> 指数代码
+    bond_signal: bool = False  # 是否显示「国债期货加仓信号」（TF/T 债基专用）
 
 
 # 未配置 panel 时的默认面板
@@ -114,6 +115,7 @@ def load_fund_categories(project_root: Path | None = None) -> dict[str, FundCate
                 fund_codes=tuple(codes),
                 panel=panel,
                 index_codes=index_codes,
+                bond_signal=bool(config.get("bond_signal", False)),
             )
         return result
 
@@ -237,6 +239,21 @@ def load_factor_fund_codes(project_root: Path | None = None) -> list[str]:
     codes: list[str] = []
     for category in categories.values():
         if category.panel in FACTOR_PANELS:
+            for code in category.fund_codes:
+                if code not in codes:
+                    codes.append(code)
+    return codes
+
+
+def load_bond_signal_fund_codes(project_root: Path | None = None) -> list[str]:
+    """从类别配置推导需要显示「国债期货加仓信号」的基金（bond_signal=true）。
+
+    目前为债基 007171；新增债基只需在类别配置里加 bond_signal = true。
+    """
+    categories = load_fund_categories(project_root)
+    codes: list[str] = []
+    for category in categories.values():
+        if category.bond_signal:
             for code in category.fund_codes:
                 if code not in codes:
                     codes.append(code)

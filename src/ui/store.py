@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import calendar
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
@@ -24,6 +24,7 @@ import streamlit as st
 
 from src.config import (
     SupabaseSettings,
+    load_bond_signal_fund_codes,
     load_factor_fund_codes,
     load_fund_categories,
     load_fund_codes,
@@ -38,6 +39,7 @@ from src.storage.supabase_store import (
     _fetch_all_rows,
     create_supabase_client,
     fetch_fund_dividends,
+    fetch_macro_rates,
     fetch_nav_history,
     list_fund_profiles,
     list_watermarks,
@@ -80,6 +82,7 @@ def _build_catalog() -> dict[str, dict]:
                 "panel": category.panel,
                 "fund_type": "",
                 "tracking_index": "",
+                "bond_signal": category.bond_signal,
             }
     return catalog
 
@@ -405,7 +408,20 @@ def _compute_period_returns_from(frame: pd.DataFrame, periods: list[str]) -> dic
 
 
 def _meta_from_catalog_and_profiles(code: str, profiles: pd.DataFrame) -> dict:
-    meta = dict(_CATALOG.get(code, {"fund_code": code, "fund_name": "", "category": "", "panel": "净值", "fund_type": "", "tracking_index": ""}))
+    meta = dict(
+        _CATALOG.get(
+            code,
+            {
+                "fund_code": code,
+                "fund_name": "",
+                "category": "",
+                "panel": "净值",
+                "fund_type": "",
+                "tracking_index": "",
+                "bond_signal": False,
+            },
+        )
+    )
     if profiles is not None and not profiles.empty and "fund_code" in profiles.columns:
         match = profiles[profiles["fund_code"].astype(str) == code]
         if not match.empty:
@@ -429,6 +445,168 @@ def get_fund_meta(code: str) -> dict:
         except Exception:  # noqa: BLE001
             profiles = None
     return _meta_from_catalog_and_profiles(code, profiles)
+
+
+# ---------- 国债期货加仓信号（固收债基，bond_signal=true 如 007171） ----------
+BOND_RANGE_OPTIONS = ["近1年", "近3年", "全部"]
+_BOND_RANGE_DAYS = {"近1年": 365, "近3年": 365 * 3}
+
+
+def get_bond_signal_codes() -> list[str]:
+    """配置中需要显示「国债期货加仓信号」的基金（bond_signal=true）。"""
+    return [normalize_fund_code(code) for code in load_bond_signal_fund_codes(PROJECT_ROOT)]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _macro_rates(url: str, key: str, rate_code: str) -> pd.DataFrame:
+    """落库宏观序列（cn_10y / bond_futures_tf / bond_futures_t），rate_date→trade_date。"""
+    frame = fetch_macro_rates(_client_for(url, key), rate_code)
+    if not frame.empty and "rate_date" in frame.columns:
+        frame = frame.rename(columns={"rate_date": "trade_date"})
+    return frame
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _bond_futures_history(url: str, key: str, code: str, start: str | None) -> dict:
+    """国债期货加仓信号历史数据：TF/T 日线 + 历史买入点位（全历史算点位再按窗口裁剪）。"""
+    from src.fetchers.bond_futures_fetcher import BOND_FUTURES
+    from src.indicators.bond_signal import mark_buy_points
+
+    daily: dict[str, pd.DataFrame] = {}
+    for _symbol, rate_code, _name in BOND_FUTURES:
+        frame = _macro_rates(url, key, rate_code)
+        if not frame.empty and "trade_date" in frame.columns:
+            frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+        daily[rate_code] = frame
+
+    nav = _nav_history(url, key, normalize_fund_code(code), None, None)
+    if not nav.empty and "trade_date" in nav.columns:
+        nav = nav.rename(columns={"trade_date": "nav_date"})
+
+    # 全历史计算买入点位（保证窗口首日涨跌幅正确），再按 start 裁剪展示
+    tf_df = daily.get("bond_futures_tf", pd.DataFrame())
+    t_df = daily.get("bond_futures_t", pd.DataFrame())
+    points = mark_buy_points(tf_df, t_df, nav) if not tf_df.empty else pd.DataFrame()
+
+    if start:
+        start_ts = pd.Timestamp(start)
+        tf_df = tf_df[tf_df["trade_date"] >= start_ts] if not tf_df.empty else tf_df
+        t_df = t_df[t_df["trade_date"] >= start_ts] if not t_df.empty else t_df
+        points = points[points["trade_date"] >= start_ts] if not points.empty else points
+
+    return {"tf": tf_df, "t": t_df, "points": points}
+
+
+def get_bond_futures_history(code: str, range_key: str = "近1年") -> dict:
+    """某债基的国债期货历史信号数据（TF/T 日线 + 买入点位）。"""
+    url, key = _credentials()
+    start = None if range_key == "全部" else (date.today() - timedelta(days=_BOND_RANGE_DAYS.get(range_key, 365))).isoformat()
+    return _bond_futures_history(url, key, normalize_fund_code(code), start)
+
+
+# 交易状态判定：可操作窗口 = 交易日 9:30 ~ 15:00（15:00 为场外基金申购截止）
+_MARKET_OPEN_START = time(9, 30)
+_MARKET_OPEN_END = time(15, 0)
+
+
+def _market_status(quotes: dict, now: datetime | None = None) -> dict:
+    """根据 TF 分钟线最新数据时间与当前时刻判定交易状态。
+
+    :return: {data_time, is_open, close_in_seconds, status_text}
+    - is_open=True：分钟数据为今天且当前处于 9:30~15:00 可操作窗口（close_in_seconds=距 15:00 秒数）
+    - 否则返回 status_text 说明原因（非交易日/未开盘/已收盘/数据缺失），绝不模拟
+    """
+    now = now or datetime.now()
+    tf = quotes.get("tf", {})
+    data_time = tf.get("data_time")
+    result = {
+        "data_time": data_time,
+        "is_open": False,
+        "close_in_seconds": None,
+        "status_text": "暂无盘中数据，无法判断交易状态",
+    }
+    if not data_time:
+        return result
+    try:
+        data_dt = datetime.fromisoformat(data_time)
+    except ValueError:
+        result["status_text"] = "分钟数据时间无法解析，无法判断交易状态"
+        return result
+    if data_dt.date() != now.date():
+        result["status_text"] = f"分钟数据为最近交易日 {data_dt:%m-%d}（当前非交易时间）"
+        return result
+    if now.time() < _MARKET_OPEN_START:
+        result["status_text"] = "当前未开盘（9:30 后可查看今日盘中信号）"
+        return result
+    if now.time() > _MARKET_OPEN_END:
+        result["status_text"] = "今日已收盘（基金申购 15:00 截止）"
+        return result
+    close_dt = datetime.combine(now.date(), _MARKET_OPEN_END)
+    seconds = int((close_dt - now).total_seconds())
+    result.update(is_open=True, close_in_seconds=max(seconds, 0), status_text="交易时间")
+    return result
+
+
+def get_bond_futures_signal(code: str) -> dict:
+    """国债期货加仓信号（今日盘中判断，实时拉取不缓存）。
+
+    TF/T 当日分钟线（akshare 实时）对比落库日线前收 → 今日涨跌幅；
+    前 2 日债基净值日涨跌取落库净值最近 2 个交易日（daily_return 为 %）；
+    market 给出交易状态（是否可操作窗口 + 距 15:00 秒数 + 数据时间）。
+    数据纪律：拿不到返回 None，绝不模拟。
+    """
+    from src.fetchers.bond_futures_fetcher import BOND_FUTURES, fetch_bond_futures_intraday
+    from src.indicators.bond_signal import evaluate
+
+    code = normalize_fund_code(code)
+    url, key = _credentials()
+
+    quotes: dict[str, dict] = {}
+    for symbol, rate_code, _name in BOND_FUTURES:
+        key_short = rate_code.replace("bond_futures_", "")  # tf / t
+        quotes[key_short] = {"price": None, "pct": None, "session_date": None, "data_time": None}
+        try:
+            daily = _macro_rates(url, key, rate_code)
+            intraday = fetch_bond_futures_intraday(symbol)
+            if daily is None or daily.empty or intraday is None or intraday.empty:
+                continue
+            daily = daily.copy()
+            daily["trade_date"] = pd.to_datetime(daily["trade_date"], errors="coerce")
+            intraday["datetime"] = pd.to_datetime(intraday["datetime"], errors="coerce")
+            intraday = intraday.dropna(subset=["datetime", "close"]).sort_values("datetime")
+            if intraday.empty:
+                continue
+            session_date = intraday["datetime"].dt.date.max()
+            last_dt = intraday["datetime"].iloc[-1]
+            prev = daily[daily["trade_date"].dt.date < session_date]
+            prev_close = float(prev["rate_value"].iloc[-1]) if not prev.empty else None
+            last_price = float(intraday["close"].iloc[-1])
+            quotes[key_short] = {
+                "price": last_price,
+                "pct": (last_price / prev_close - 1) * 100.0 if prev_close else None,
+                "session_date": session_date.isoformat(),
+                "data_time": last_dt.isoformat(),
+            }
+        except Exception:  # noqa: BLE001
+            continue
+
+    # 前 2 日债基净值日涨跌（%）（近 90 天窗口足够覆盖 2 个交易日）
+    nav_prev2: list[float] = []
+    try:
+        nav = _nav_history(url, key, code, (date.today() - timedelta(days=90)).isoformat(), None)
+        if not nav.empty and "daily_return" in nav.columns:
+            nav_prev2 = nav["daily_return"].astype(float).dropna().tolist()[-2:]
+    except Exception:  # noqa: BLE001
+        nav_prev2 = []
+
+    signal = evaluate(quotes.get("tf", {}).get("pct"), quotes.get("t", {}).get("pct"), nav_prev2)
+    return {
+        "tf": quotes.get("tf", {}),
+        "t": quotes.get("t", {}),
+        "nav_prev2": nav_prev2,
+        "signal": signal,
+        "market": _market_status(quotes),
+    }
 
 
 @st.cache_data(ttl=300, show_spinner=False)

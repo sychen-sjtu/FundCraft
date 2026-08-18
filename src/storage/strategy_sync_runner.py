@@ -191,7 +191,10 @@ def _refresh_funds(client, fund_codes: list[str], progress: SyncProgress | None 
 
 
 def _refresh_rate(client, progress: SyncProgress | None = None) -> list[dict]:
-    """宏观层：cn_10y + 水位（增量：从「水位 - OVERLAP_DAYS」起拉，空则全量）。"""
+    """宏观层：cn_10y + 国债期货(TF/T) + 水位（增量：从「水位 - OVERLAP_DAYS」起拉，空则全量）。"""
+    from src.fetchers.bond_futures_fetcher import BOND_FUTURES, fetch_bond_futures_daily
+
+    results: list[dict] = []
     if progress:
         progress.step("宏观层：cn_10y 利率")
     try:
@@ -201,9 +204,25 @@ def _refresh_rate(client, progress: SyncProgress | None = None) -> list[dict]:
         n = upsert_macro_rates(client, rate)
         if not rate.empty and "rate_date" in rate.columns:
             upsert_watermark(client, "rate", "cn_10y", rate["rate_date"].max(), source="bond_zh_us_rate")
-        return [{"entity": "rate", "rows": n}]
+        results.append({"entity": "rate", "rows": n})
     except Exception as exc:  # noqa: BLE001
-        return [{"entity": "rate", "error": str(exc)}]
+        results.append({"entity": "rate", "error": str(exc)})
+
+    # 国债期货主力连续日线（TF/T 各一个 rate_code，落 macro_rates_history）
+    for symbol, rate_code, _name in BOND_FUTURES:
+        if progress:
+            progress.step(f"宏观层：国债期货 {symbol}")
+        try:
+            since = _since_date(_watermark_map(client), ("rate", rate_code))
+            start = since.replace("-", "") if since else "20170101"
+            futures = fetch_bond_futures_daily(symbol, start_date=start)
+            n = upsert_macro_rates(client, futures)
+            if not futures.empty and "trade_date" in futures.columns:
+                upsert_watermark(client, "rate", rate_code, futures["trade_date"].max(), source="sina")
+            results.append({"entity": "rate", "rate_code": rate_code, "rows": n})
+        except Exception as exc:  # noqa: BLE001
+            results.append({"entity": "rate", "rate_code": rate_code, "error": str(exc)})
+    return results
 
 
 def _refresh_indexes(client, registry, progress: SyncProgress | None = None) -> list[dict]:
@@ -398,8 +417,8 @@ def refresh_layer(client, layer_key: str, progress: SyncProgress | None = None) 
         tracker.report(0, f"基金层：共 {len(fund_codes)} 只基金")
         results = _refresh_funds(client, fund_codes, tracker)
     elif layer_key == "rate":
-        tracker = SyncProgress(1, progress)
-        tracker.report(0, "宏观层：cn_10y 利率")
+        tracker = SyncProgress(3, progress)
+        tracker.report(0, "宏观层：cn_10y 利率 + 国债期货 TF/T")
         results = _refresh_rate(client, tracker)
     elif layer_key == "index":
         registry = load_index_registry()

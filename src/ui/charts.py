@@ -501,3 +501,163 @@ def build_rsi_dashboard_chart(data: dict) -> go.Figure:
     fig.update_xaxes(row=1, col=1, showgrid=False, tickformat="%Y-%m-%d")
     fig.update_xaxes(row=2, col=1, showgrid=True, gridcolor="#F0F0F0", tickformat="%Y-%m-%d")
     return fig
+
+
+# ---------- 国债期货加仓信号（TF/T 双线 + 每日涨跌 + 历史买入点位） ----------
+_BOND_COND1_COLOR = "#E64A3D"  # 条件1（优选/强化）红上三角 / 红竖线
+_BOND_COND2_COLOR = "#722ED1"  # 条件2（连跌）紫菱形 / 紫竖线
+_BOND_T_COLOR = "#9DB3CC"  # T(10年) 辅助线/柱（浅蓝灰，不抢 TF 主线）
+_BOND_LEVEL_LABELS = {
+    "cond1_preferred": "条件1·优选",
+    "cond1_strengthen": "条件1·强化",
+    "cond2_streak": "条件2·连跌",
+}
+
+
+def _add_bond_buy_markers(figure: go.Figure, data: dict, anchor: str = "tf") -> None:
+    """在历史曲线上叠加买入点位标记（条件1 红上三角 / 条件2 紫菱形）。"""
+    points = data.get("points", pd.DataFrame())
+    if points.empty:
+        return
+    buys = points[points["trigger"]].copy()
+    if buys.empty:
+        return
+    series = data.get(anchor, pd.DataFrame())
+    if series.empty:
+        return
+    # 取锚定价格（TF 收盘）作为标记纵坐标
+    merged = buys.merge(series[["trade_date", "rate_value"]].drop_duplicates("trade_date"), on="trade_date", how="left")
+
+    cond1 = merged[merged["level"].isin(["cond1_preferred", "cond1_strengthen"])]
+    cond2 = merged[merged["level"] == "cond2_streak"]
+    for sel, color, symbol, label in (
+        (cond1, _BOND_COND1_COLOR, "triangle-up", "条件1(优选/强化)"),
+        (cond2, _BOND_COND2_COLOR, "diamond", "条件2(连跌)"),
+    ):
+        if sel.empty:
+            continue
+        figure.add_trace(
+            go.Scatter(
+                x=sel["trade_date"], y=sel["rate_value"], mode="markers",
+                name=label,
+                marker=dict(symbol=symbol, size=11, color=color, line=dict(width=1, color="#FFFFFF")),
+                customdata=sel["level"].map(_BOND_LEVEL_LABELS),
+                hovertemplate="%{x|%Y-%m-%d}<br>%{customdata}<br>TF：%{y:.3f}<extra></extra>",
+            )
+        )
+
+
+def build_bond_futures_curve_chart(data: dict) -> go.Figure:
+    """图1 历史曲线：TF + T 主力连续收盘双折线 + 历史买入点位标记。"""
+    from src.ui.theme import COLOR_FUND_HIGHLIGHT
+
+    figure = go.Figure()
+    tf_df = data.get("tf", pd.DataFrame())
+    if tf_df.empty:
+        return figure
+
+    tf = tf_df.sort_values("trade_date")
+    figure.add_trace(
+        go.Scatter(
+            x=tf["trade_date"], y=tf["rate_value"], name="TF(5年)",
+            line=dict(color=COLOR_FUND_HIGHLIGHT, width=2),
+            hovertemplate="%{x|%Y-%m-%d}<br>TF：%{y:.3f}<extra></extra>",
+        )
+    )
+
+    t_df = data.get("t", pd.DataFrame())
+    if not t_df.empty:
+        t = t_df.sort_values("trade_date")
+        figure.add_trace(
+            go.Scatter(
+                x=t["trade_date"], y=t["rate_value"], name="T(10年)",
+                line=dict(color=_BOND_T_COLOR, width=1.4),
+                hovertemplate="%{x|%Y-%m-%d}<br>T：%{y:.3f}<extra></extra>",
+            )
+        )
+
+    _add_bond_buy_markers(figure, data, anchor="tf")
+
+    figure.update_layout(
+        template="plotly_white",
+        height=240,
+        margin=dict(l=4, r=4, t=16, b=10),
+        hovermode="x unified",
+        dragmode=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=11)),
+    )
+    figure.update_yaxes(zeroline=True, zerolinecolor="#B0B0B0", zerolinewidth=1.2, gridcolor="#F0F0F0", nticks=7)
+    figure.update_xaxes(showgrid=False, tickformat="%Y-%m-%d")
+    return figure
+
+
+def build_bond_futures_change_chart(data: dict) -> go.Figure:
+    """图2 每日净涨跌：TF + T 日涨跌幅双柱（红涨绿跌）+ 买入点位竖线。"""
+    from src.ui.theme import COLOR_DOWN, COLOR_UP
+
+    figure = go.Figure()
+    tf_df = data.get("tf", pd.DataFrame())
+    if tf_df.empty:
+        return figure
+
+    tf = tf_df.sort_values("trade_date").copy()
+    tf["pct"] = tf["rate_value"].astype(float).pct_change() * 100.0
+    tf = tf.dropna(subset=["pct"])
+    if tf.empty:
+        return figure
+
+    tf_colors = [COLOR_UP if value >= 0 else COLOR_DOWN for value in tf["pct"]]
+    figure.add_trace(
+        go.Bar(
+            x=tf["trade_date"], y=tf["pct"], name="TF日涨跌",
+            marker_color=tf_colors, opacity=0.7,
+            hovertemplate="%{x|%Y-%m-%d}<br>TF：%{y:.2f}%<extra></extra>",
+        )
+    )
+
+    t_df = data.get("t", pd.DataFrame())
+    if not t_df.empty:
+        t = t_df.sort_values("trade_date").copy()
+        t["pct"] = t["rate_value"].astype(float).pct_change() * 100.0
+        t = t.dropna(subset=["pct"])
+        if not t.empty:
+            t_colors = [COLOR_UP if value >= 0 else COLOR_DOWN for value in t["pct"]]
+            figure.add_trace(
+                go.Bar(
+                    x=t["trade_date"], y=t["pct"], name="T日涨跌",
+                    marker_color=t_colors, opacity=0.28,
+                    hovertemplate="%{x|%Y-%m-%d}<br>T：%{y:.2f}%<extra></extra>",
+                )
+            )
+
+    # 买入点位竖线（条件1 红实/虚、条件2 紫点）
+    points = data.get("points", pd.DataFrame())
+    if not points.empty:
+        buys = points[points["trigger"]]
+        for level, color, dash, label in (
+            ("cond1_preferred", _BOND_COND1_COLOR, "solid", "条件1·优选"),
+            ("cond1_strengthen", _BOND_COND1_COLOR, "dash", "条件1·强化"),
+            ("cond2_streak", _BOND_COND2_COLOR, "dot", "条件2·连跌"),
+        ):
+            sel = buys[buys["level"] == level]
+            if sel.empty:
+                continue
+            for d in sel["trade_date"]:
+                figure.add_vline(x=d, line_width=1, line_dash=dash, line_color=color, opacity=0.55)
+            # 图例（用空序列展示线型）
+            figure.add_trace(
+                go.Scatter(x=[None], y=[None], mode="lines", name=label, line=dict(color=color, dash=dash))
+            )
+
+    figure.update_layout(
+        template="plotly_white",
+        height=200,
+        margin=dict(l=4, r=4, t=16, b=10),
+        hovermode="x unified",
+        dragmode=False,
+        barmode="overlay",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=11)),
+    )
+    figure.update_yaxes(zeroline=True, zerolinecolor="#B0B0B0", zerolinewidth=1.2, gridcolor="#F0F0F0", nticks=7)
+    figure.update_xaxes(showgrid=False, tickformat="%Y-%m-%d")
+    return figure

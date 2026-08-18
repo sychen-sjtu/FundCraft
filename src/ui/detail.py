@@ -15,6 +15,8 @@ import streamlit as st
 from src.config import load_compare_index_codes, load_index_registry
 from src.ui import store
 from src.ui.charts import (
+    build_bond_futures_change_chart,
+    build_bond_futures_curve_chart,
     build_cumulative_vs_benchmark_chart,
     build_dividend_history_chart,
     build_drawdown_area_chart,
@@ -558,6 +560,199 @@ def _render_bond_metrics(code: str) -> None:
     st.markdown(card_html, unsafe_allow_html=True)
 
 
+_BOND_LEVEL_LABELS = {
+    "cond1_preferred": "条件1·优选",
+    "cond1_strengthen": "条件1·强化",
+    "cond2_streak": "条件2·连跌",
+    "none": "未触发",
+}
+
+
+def _bond_quote_cell(label: str, quote: dict) -> str:
+    """行情宫格单元格：名称 + 价格 + 今日涨跌%（红涨绿跌，无数据显「—」）。"""
+    price = quote.get("price")
+    pct = quote.get("pct")
+    price_text = f"{price:.3f}" if price is not None else "—"
+    if pct is None:
+        pct_cls, pct_text = "neutral", "暂无"
+    else:
+        pct_cls = "up" if pct > 0 else ("down" if pct < 0 else "flat")
+        pct_text = f"{pct:+.2f}%"
+    value_html = (
+        f'<span class="fc-bond-value neutral">{price_text}</span>'
+        f'<span class="fc-bond-value {pct_cls}" style="font-size:13px;margin-left:4px;">{pct_text}</span>'
+    )
+    return _bond_cell(label, value_html)
+
+
+def _render_trading_countdown(seconds: int) -> None:
+    """交易时间倒计时：距今日 15:00 申购截止（iframe 内 JS 每秒刷新）。"""
+    html = (
+        "<style>body{margin:0;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;"
+        "font-size:13px;color:#E64A3D;font-weight:600;}</style>"
+        "距今日 15:00 申购截止 <span id='cd'>--:--:--</span>"
+        "<script>"
+        f"const total={int(seconds)};"
+        "const target=Date.now()+total*1000;"
+        "function pad(n){return String(n).padStart(2,'0');}"
+        "function tick(){"
+        "const r=Math.max(0,target-Date.now());"
+        "const h=Math.floor(r/3600000),m=Math.floor((r%3600000)/60000),s=Math.floor((r%60000)/1000);"
+        "const el=document.getElementById('cd');if(el)el.textContent=pad(h)+':'+pad(m)+':'+pad(s);"
+        "if(r>0)setTimeout(tick,1000);"
+        "}"
+        "tick();"
+        "</script>"
+    )
+    st.iframe(html, height=26)
+
+
+def _render_bond_signal_result(result: dict, code: str) -> None:
+    """交易状态提示 + 今日盘中行情宫格 + 判定横幅（建议申购/建议观望，不带金额）。"""
+    # 交易状态：交易时间显示数据时间+倒计时；非交易时间提示不建议操作
+    market = result.get("market", {})
+    if market.get("is_open"):
+        data_time_txt = "—"
+        data_time = market.get("data_time")
+        if data_time:
+            try:
+                data_time_txt = pd.Timestamp(data_time).strftime("%m-%d %H:%M")
+            except Exception:  # noqa: BLE001
+                data_time_txt = str(data_time)
+        st.markdown(
+            f'<div style="background:#EFF8F3;border:1px solid #C9EBD9;border-radius:10px;'
+            f'padding:8px 14px;font-size:13px;color:#1F7A4D;margin:6px 0;">'
+            f'🟢 交易时间 · 分钟数据时间：{data_time_txt}</div>',
+            unsafe_allow_html=True,
+        )
+        seconds = market.get("close_in_seconds")
+        if seconds is not None:
+            _render_trading_countdown(seconds)
+    else:
+        status_text = market.get("status_text", "")
+        st.warning(f"⏸ 当前为非交易时间，不建议进行操作。{status_text}")
+
+    tf = result.get("tf", {})
+    t = result.get("t", {})
+    nav_prev2 = result.get("nav_prev2", [])
+    signal = result.get("signal", {})
+
+    nav_text = "、".join(f"{v:+.2f}%" for v in nav_prev2) if nav_prev2 else "暂无"
+    card_html = (
+        '<div class="fc-bond-card">'
+        '<div class="fc-bond-title">今日盘中行情（14:30 判断）</div>'
+        '<div class="fc-bond-grid">'
+        + _bond_quote_cell("TF(5年)", tf)
+        + _bond_quote_cell("T(10年)", t)
+        + _bond_cell("债基前2日净值", f'<span class="fc-bond-value neutral">{nav_text}</span>')
+        + "</div></div>"
+    )
+    st.markdown(card_html, unsafe_allow_html=True)
+
+    level = signal.get("level", "none")
+    trigger = bool(signal.get("trigger", False))
+    suggestion = signal.get("suggestion", "建议观望")
+    reason = signal.get("reason", "")
+    icon = {"cond1_preferred": "🟢", "cond1_strengthen": "🟡", "cond2_streak": "🟣"}.get(level, "⚪")
+    banner_cls = "up" if trigger else "flat"
+    level_label = _BOND_LEVEL_LABELS.get(level, level)
+    st.markdown(
+        f'<div style="background:#FFFFFF;border:1px solid #EDEFF2;border-radius:10px;'
+        f'padding:10px 14px;font-size:13px;color:#1F2329;margin:8px 0;">'
+        f'<b>{icon} 判定：{level_label}</b>　<span class="fc-{banner_cls}">{suggestion}</span>'
+        f'<div style="color:#8A8F99;font-size:12px;margin-top:4px;">{reason}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_bond_futures_signal(code: str) -> None:
+    """国债期货加仓信号（固收债基专用，bond_signal=true）：今日判断 + 历史曲线/涨跌/买点。
+
+    规则：条件1·优选 TF跌≤-0.10% / 条件1·强化 -0.10<TF≤-0.08%且T≤-0.15% /
+    条件2·连跌 前2日净值收负且今日盘中TF仍跌。只给「建议申购/建议观望」，不带金额；
+    历史买入点位直接用当日收盘数据套同一套规则判定。
+    """
+    st.divider()
+    bond_codes = store.get_bond_signal_codes()
+    if not bond_codes:
+        return
+    options = bond_codes if code in bond_codes else [code] + bond_codes
+    sel_code = st.selectbox(
+        "选定债基（信号参考净值）",
+        options=options,
+        format_func=lambda c: f"{store.get_fund_meta(c).get('fund_name') or c}（{c}）",
+        index=options.index(code) if code in options else 0,
+        key=f"bond_signal_fund_{code}",
+        label_visibility="collapsed",
+    )
+
+    with st.container(horizontal=True, key=f"bf_head_{code}"):
+        st.markdown(
+            '<span style="font-size:13px;font-weight:700;color:#1F2329;">📡 国债期货加仓信号'
+            '<span class="fc-help" data-tip="规则：条件1·优选 TF当日跌≤-0.10%；条件1·强化 TF跌-0.10%~-0.08%且T跌≤-0.15%；'
+            '条件2·连跌 债基前2日净值收负且今日盘中TF仍跌。触发=建议申购（不带金额），否则建议观望。'
+            '历史买入点位基于当日收盘数据计算。">?</span></span>',
+            unsafe_allow_html=True,
+        )
+        range_key = st.segmented_control(
+            "历史范围",
+            options=store.BOND_RANGE_OPTIONS,
+            default="近1年",
+            selection_mode="single",
+            label_visibility="collapsed",
+            key=f"bf_range_{code}",
+        )
+
+    # 今日盘中信号（按钮触发，实时拉取，结果存 session_state 防重跑丢失）
+    check_key = f"bf_check_{sel_code}"
+    if st.button("🔍 现在检查（14:30 盘中判断）", key=check_key, use_container_width=True):
+        with st.spinner("正在拉取 TF/T 盘中行情…"):
+            try:
+                st.session_state[f"bf_result_{sel_code}"] = store.get_bond_futures_signal(sel_code)
+            except Exception as exc:  # noqa: BLE001
+                st.session_state[f"bf_result_{sel_code}"] = {"error": str(exc)}
+    result = st.session_state.get(f"bf_result_{sel_code}")
+    if result is None:
+        st.caption("点击「现在检查」拉取当日 TF/T 盘中行情并给出加仓建议（建议申购/建议观望）。")
+    elif "error" in result:
+        st.error(f"信号计算失败：{result['error']}")
+    else:
+        _render_bond_signal_result(result, sel_code)
+
+    # 历史曲线 + 每日涨跌（含历史买入点位）
+    data = store.get_bond_futures_history(sel_code, range_key)
+    if not data or data.get("tf", pd.DataFrame()).empty:
+        st.info("暂无国债期货日线数据（请先在数据管理页刷新宏观层：cn_10y + 国债期货）。")
+        return
+    st.plotly_chart(
+        build_bond_futures_curve_chart(data),
+        width="stretch",
+        config=PLOTLY_CONFIG,
+        key=f"bf_curve_{code}_{range_key}",
+    )
+    st.plotly_chart(
+        build_bond_futures_change_chart(data),
+        width="stretch",
+        config=PLOTLY_CONFIG,
+        key=f"bf_change_{code}_{range_key}",
+    )
+
+    # 统计条 + 历史点位口径标注
+    points = data.get("points", pd.DataFrame())
+    buys = points[points["trigger"]] if not points.empty else points
+    if not buys.empty:
+        counts = buys["level"].value_counts()
+        n_pref = int(counts.get("cond1_preferred", 0))
+        n_stre = int(counts.get("cond1_strengthen", 0))
+        n_streak = int(counts.get("cond2_streak", 0))
+        st.caption(
+            f"近{range_key} 触发买入 {len(buys)} 次（优选 {n_pref} · 强化 {n_stre} · 连跌 {n_streak}）"
+            "　· 历史买入点位基于当日收盘数据"
+        )
+    else:
+        st.caption("历史买入点位基于当日收盘数据计算")
+
+
 def render() -> None:
     if not store.is_connected():
         st.warning("请先在侧边栏「数据连接」输入解密口令并连接 Supabase。")
@@ -579,6 +774,10 @@ def render() -> None:
     # ---------- 固收+ 核心指标（历史年化/最大回撤/卡玛/年限/规模） ----------
     if meta["panel"] == "固收":
         _render_bond_metrics(code)
+
+    # ---------- 国债期货加仓信号（固收债基专用，bond_signal=true） ----------
+    if meta.get("bond_signal"):
+        _render_bond_futures_signal(code)
 
     # ---------- 时间范围胶囊（联动下方所有图表与指标） ----------
     range_key = st.segmented_control(
