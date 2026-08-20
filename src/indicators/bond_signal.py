@@ -30,6 +30,11 @@ LEVEL_LABELS = {
 }
 
 
+def _fmt_pct(value: float | None, ndigits: int = 2) -> str:
+    """格式化涨跌幅（%），None → '—'。"""
+    return "—" if value is None else f"{value:+.{ndigits}f}%"
+
+
 def evaluate(
     tf_pct: float | None,
     t_pct: float | None,
@@ -40,54 +45,113 @@ def evaluate(
     :param tf_pct: 今日盘中 TF 涨跌幅(%)；None 表示无数据。
     :param t_pct: 今日盘中 T 涨跌幅(%)；None 表示无数据。
     :param nav_pct_prev2: 当前债基前 2 个交易日净值日涨跌(%)列表；不足/无数据传 None。
-    :return: {trigger, level, suggestion, reason}
+    :return: {trigger, level, suggestion, reason, indicators}
+      indicators: 三个指标逐项 {key, label, ok, detail}，供 UI 直观展示各条件是否满足。
     """
+    # ---- 指标1·优选：TF 单日大跌 ----
+    cond1_pref_ok = tf_pct is not None and tf_pct <= TF_PREFERRED
     if tf_pct is None:
-        return {
+        detail1 = "今日无 TF 行情数据"
+    else:
+        detail1 = f"TF 今日 {_fmt_pct(tf_pct)}（阈值 ≤{TF_PREFERRED:.2f}%）"
+        detail1 += "，满足" if cond1_pref_ok else "，跌幅不足，不满足" if tf_pct < 0 else "，TF 未跌，不满足"
+    ind1 = {
+        "key": "cond1_preferred",
+        "label": "指标1·优选：TF 单日大跌",
+        "ok": cond1_pref_ok,
+        "detail": detail1,
+    }
+
+    # ---- 指标2·强化：TF 略跌 + T 大跌 ----
+    tf_in_band = tf_pct is not None and (TF_STRENGTHEN_HIGH < tf_pct <= TF_STRENGTHEN_LOW)
+    cond1_stre_ok = tf_in_band and t_pct is not None and t_pct <= T_STRENGTHEN
+    if tf_pct is None or t_pct is None:
+        detail2 = f"TF {_fmt_pct(tf_pct)} / T {_fmt_pct(t_pct)}（数据不足）"
+    else:
+        detail2 = (
+            f"TF {_fmt_pct(tf_pct)}（区间 {TF_STRENGTHEN_HIGH:.2f}%~{TF_STRENGTHEN_LOW:.2f}%）"
+            f"、T {_fmt_pct(t_pct)}（阈值 ≤{T_STRENGTHEN:.2f}%）"
+        )
+        if tf_in_band and t_pct <= T_STRENGTHEN:
+            detail2 += "，均满足"
+        elif not tf_in_band and t_pct > T_STRENGTHEN:
+            detail2 += "，均不满足"
+        elif not tf_in_band:
+            detail2 += "，TF 不在区间，不满足"
+        else:
+            detail2 += "，T 跌幅不足，不满足"
+    ind2 = {
+        "key": "cond1_strengthen",
+        "label": "指标2·强化：TF 略跌 + T 大跌",
+        "ok": cond1_stre_ok,
+        "detail": detail2,
+    }
+
+    # ---- 指标3·连跌：前2日净值收负 + 今日盘中 TF 仍跌 ----
+    streak_nav_ok = (
+        nav_pct_prev2 is not None
+        and len(nav_pct_prev2) >= STREAK_DAYS
+        and all(value < 0 for value in nav_pct_prev2)
+    )
+    cond2_ok = streak_nav_ok and tf_pct is not None and tf_pct < 0
+    if nav_pct_prev2 is None or len(nav_pct_prev2) < STREAK_DAYS:
+        detail3 = f"前{STREAK_DAYS}日净值数据不足（{len(nav_pct_prev2) if nav_pct_prev2 else 0} 日）"
+    else:
+        detail3 = f"前{STREAK_DAYS}日净值 {'、'.join(_fmt_pct(v) for v in nav_pct_prev2)}（需均<0）"
+        detail3 += f"、今日 TF {_fmt_pct(tf_pct)}（需<0）"
+        if streak_nav_ok and tf_pct is not None and tf_pct < 0:
+            detail3 += "，均满足"
+        elif not streak_nav_ok:
+            detail3 += "，前2日未连跌，不满足"
+        else:
+            detail3 += "，今日 TF 未跌，不满足"
+    ind3 = {
+        "key": "cond2_streak",
+        "label": "指标3·连跌：前2日净值收负 + 今日TF跌",
+        "ok": cond2_ok,
+        "detail": detail3,
+    }
+    indicators = [ind1, ind2, ind3]
+
+    # ---- 汇总判定 ----
+    if tf_pct is None:
+        result: dict = {
             "trigger": False,
             "level": "none",
             "suggestion": "建议观望",
             "reason": "今日无 TF 行情数据，无法判断",
         }
-
-    # 条件1·优选：TF 单日大跌
-    if tf_pct <= TF_PREFERRED:
-        return {
+    elif cond1_pref_ok:
+        result = {
             "trigger": True,
             "level": "cond1_preferred",
             "suggestion": "建议申购",
             "reason": f"TF 今日跌 {tf_pct:.2f}% ≤ -0.10%，单日大跌（优选）触发",
         }
-
-    # 条件1·强化：TF 跌幅略低于阈值，但 T 跌幅大 → 全场情绪转差
-    if (TF_STRENGTHEN_HIGH < tf_pct <= TF_STRENGTHEN_LOW) and (t_pct is not None and t_pct <= T_STRENGTHEN):
-        return {
+    elif cond1_stre_ok:
+        result = {
             "trigger": True,
             "level": "cond1_strengthen",
             "suggestion": "建议申购",
             "reason": f"TF 跌 {tf_pct:.2f}% 且 T 跌 {t_pct:.2f}% ≤ -0.15%，情绪转差（强化）触发",
         }
-
-    # 条件2·连跌：前 N 日债基净值均收负，且今日盘中 TF 仍跌
-    if (
-        nav_pct_prev2 is not None
-        and len(nav_pct_prev2) >= STREAK_DAYS
-        and all(value < 0 for value in nav_pct_prev2)
-        and tf_pct < 0
-    ):
-        return {
+    elif cond2_ok:
+        result = {
             "trigger": True,
             "level": "cond2_streak",
             "suggestion": "建议申购",
             "reason": f"债基已连跌 {STREAK_DAYS} 日且今日盘中 TF 仍跌 {tf_pct:.2f}%，连跌触发",
         }
+    else:
+        result = {
+            "trigger": False,
+            "level": "none",
+            "suggestion": "建议观望",
+            "reason": "未触发任何条件，今日按兵不动",
+        }
 
-    return {
-        "trigger": False,
-        "level": "none",
-        "suggestion": "建议观望",
-        "reason": "未触发任何条件，今日按兵不动",
-    }
+    result["indicators"] = indicators
+    return result
 
 
 def mark_buy_points(

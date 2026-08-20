@@ -263,7 +263,7 @@ GLOBAL_CSS = """
   box-shadow: 0 0 0 2px rgba(22,119,255,0.15) !important;
 }
 
-/* 固收+ 核心指标宫格卡片（单卡片 2 列 + 底行通栏） */
+/* 债券基金核心指标宫格卡片（固收+/债基 共用，单卡片 2 列 + 底行通栏） */
 .fc-bond-card {
   background: #FFFFFF;
   border: 1px solid #EDEFF2;

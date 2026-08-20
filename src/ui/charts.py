@@ -587,7 +587,7 @@ def build_bond_futures_curve_chart(data: dict) -> go.Figure:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=11)),
     )
     figure.update_yaxes(zeroline=True, zerolinecolor="#B0B0B0", zerolinewidth=1.2, gridcolor="#F0F0F0", nticks=7)
-    figure.update_xaxes(showgrid=False, tickformat="%Y-%m-%d")
+    figure.update_xaxes(showgrid=False, tickformat="%Y-%m-%d", rangeslider_visible=False)
     return figure
 
 
@@ -659,5 +659,107 @@ def build_bond_futures_change_chart(data: dict) -> go.Figure:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=11)),
     )
     figure.update_yaxes(zeroline=True, zerolinecolor="#B0B0B0", zerolinewidth=1.2, gridcolor="#F0F0F0", nticks=7)
-    figure.update_xaxes(showgrid=False, tickformat="%Y-%m-%d")
+    figure.update_xaxes(showgrid=False, tickformat="%Y-%m-%d", rangeslider_visible=False)
+    return figure
+
+
+def _resample_candles(df: pd.DataFrame, rule: str = "5min") -> pd.DataFrame:
+    """分钟线聚合成 K 线（按 rule 重采样 OHLC），供当日盘中 K 线图使用。"""
+    frame = df.copy()
+    frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
+    frame = frame.dropna(subset=["datetime", "open", "high", "low", "close"])
+    frame = frame.set_index("datetime").sort_index()
+    if frame.empty:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    agg = (
+        frame.resample(rule)
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+        .dropna(subset=["open", "close"])
+    )
+    return agg
+
+
+def build_bond_futures_intraday_chart(data: dict) -> go.Figure:
+    """当日盘中 K 线：TF/T 分钟线聚合成 5 分钟 K 线（红涨绿跌）+ 前收参考线。
+
+    直观展示「当日用来预估加仓信号」的盘中走势：K 线相对前收线的位置 = 今日涨跌。
+
+    :param data: store.get_bond_futures_signal 的返回 dict（intraday 分钟数据 + tf/t 前收）。
+    """
+    from src.ui.theme import COLOR_DOWN, COLOR_UP
+
+    intraday = data.get("intraday", {})
+    tf_df = intraday.get("tf", pd.DataFrame())
+    t_df = intraday.get("t", pd.DataFrame())
+    n_rows = int(not tf_df.empty) + int(not t_df.empty)
+    if n_rows == 0:
+        return go.Figure()
+
+    figure = make_subplots(rows=n_rows, cols=1, shared_xaxes=True, vertical_spacing=0.2, row_heights=[0.5] * n_rows)
+    row = 0
+    for key, name in (("tf", "TF(5年)"), ("t", "T(10年)")):
+        df = intraday.get(key, pd.DataFrame())
+        if df.empty:
+            continue
+        row += 1
+        agg = _resample_candles(df)
+        if agg.empty:
+            continue
+        figure.add_trace(
+            go.Candlestick(
+                x=agg.index,
+                open=agg["open"], high=agg["high"], low=agg["low"], close=agg["close"],
+                name=name,
+                increasing_line_color=COLOR_UP, decreasing_line_color=COLOR_DOWN,
+                increasing_fillcolor=COLOR_UP, decreasing_fillcolor=COLOR_DOWN,
+                showlegend=False,
+                hovertemplate=(
+                    f"%{{x|%H:%M}}<br>{name} 开 %{{open:.3f}} 高 %{{high:.3f}} "
+                    f"低 %{{low:.3f}} 收 %{{close:.3f}}<extra></extra>"
+                ),
+            ),
+            row=row, col=1,
+        )
+        # 当日 OHLC（开/高/低/收）
+        prev_close = data.get(key, {}).get("prev_close")
+        day_open = float(agg["open"].iloc[0])
+        day_close = float(agg["close"].iloc[-1])
+
+        # 参考线：只标 昨收（灰虚线）/ 今开（蓝虚线）两条，最高/最低不再标注
+        if prev_close:
+            figure.add_hline(
+                y=prev_close, line_dash="dash", line_color="#8A8F99", line_width=1,
+                annotation_text=f"昨收 {prev_close:.3f}", annotation_position="top left",
+                row=row, col=1,
+            )
+        figure.add_hline(
+            y=day_open, line_dash="dash", line_color="#4A90D9", line_width=1,
+            annotation_text=f"今开 {day_open:.3f}", annotation_position="bottom left",
+            row=row, col=1,
+        )
+
+        # 当前状态：子图顶部彩色文字（红涨绿跌 vs 昨收），不占参考线
+        # 未收盘=当前价（实时升/降），收盘后=收盘价
+        if prev_close:
+            change = (day_close / prev_close - 1) * 100.0
+            up = change >= 0
+            state_color = COLOR_UP if up else COLOR_DOWN
+            figure.add_annotation(
+                xref="x domain" if row == 1 else "x2 domain",
+                yref="y domain" if row == 1 else "y2 domain",
+                x=0.5, y=1.0, xanchor="center", yanchor="bottom", showarrow=False,
+                text=f"{name}　<b>当前 {day_close:.3f}</b>　{'▲ 涨' if up else '▼ 跌'} {change:+.2f}%",
+                font=dict(size=12, color=state_color),
+            )
+        figure.update_yaxes(row=row, col=1, title_text="", gridcolor="#F0F0F0", nticks=6)
+
+    figure.update_layout(
+        template="plotly_white",
+        height=145 * n_rows + 45,
+        margin=dict(l=4, r=4, t=30, b=8),
+        dragmode=False,
+    )
+    # shared_xaxes 时底部子图轴名为 xaxis2，必须对所有 x 轴统一关闭缩略条
+    figure.update_xaxes(rangeslider_visible=False)
+    figure.update_xaxes(row=n_rows, col=1, tickformat="%H:%M", showgrid=False)
     return figure

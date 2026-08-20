@@ -82,7 +82,6 @@ def _build_catalog() -> dict[str, dict]:
                 "panel": category.panel,
                 "fund_type": "",
                 "tracking_index": "",
-                "bond_signal": category.bond_signal,
             }
     return catalog
 
@@ -418,7 +417,6 @@ def _meta_from_catalog_and_profiles(code: str, profiles: pd.DataFrame) -> dict:
                 "panel": "净值",
                 "fund_type": "",
                 "tracking_index": "",
-                "bond_signal": False,
             },
         )
     )
@@ -447,13 +445,13 @@ def get_fund_meta(code: str) -> dict:
     return _meta_from_catalog_and_profiles(code, profiles)
 
 
-# ---------- 国债期货加仓信号（固收债基，bond_signal=true 如 007171） ----------
-BOND_RANGE_OPTIONS = ["近1年", "近3年", "全部"]
-_BOND_RANGE_DAYS = {"近1年": 365, "近3年": 365 * 3}
+# ---------- 国债期货加仓信号（panel=债基，如 007171） ----------
+BOND_RANGE_OPTIONS = ["近1月", "近3月", "近6月", "近1年", "近3年", "全部"]
+_BOND_RANGE_DAYS = {"近1月": 30, "近3月": 90, "近6月": 180, "近1年": 365, "近3年": 365 * 3}
 
 
 def get_bond_signal_codes() -> list[str]:
-    """配置中需要显示「国债期货加仓信号」的基金（bond_signal=true）。"""
+    """配置中需要显示「国债期货加仓信号」的基金（panel=债基）。"""
     return [normalize_fund_code(code) for code in load_bond_signal_fund_codes(PROJECT_ROOT)]
 
 
@@ -562,31 +560,45 @@ def get_bond_futures_signal(code: str) -> dict:
     url, key = _credentials()
 
     quotes: dict[str, dict] = {}
+    intraday: dict[str, pd.DataFrame] = {}
     for symbol, rate_code, _name in BOND_FUTURES:
         key_short = rate_code.replace("bond_futures_", "")  # tf / t
-        quotes[key_short] = {"price": None, "pct": None, "session_date": None, "data_time": None}
+        quotes[key_short] = {"price": None, "pct": None, "session_date": None, "data_time": None, "prev_close": None}
         try:
             daily = _macro_rates(url, key, rate_code)
-            intraday = fetch_bond_futures_intraday(symbol)
-            if daily is None or daily.empty or intraday is None or intraday.empty:
+            minute = fetch_bond_futures_intraday(symbol)
+            if daily is None or daily.empty or minute is None or minute.empty:
                 continue
             daily = daily.copy()
             daily["trade_date"] = pd.to_datetime(daily["trade_date"], errors="coerce")
-            intraday["datetime"] = pd.to_datetime(intraday["datetime"], errors="coerce")
-            intraday = intraday.dropna(subset=["datetime", "close"]).sort_values("datetime")
-            if intraday.empty:
+            minute["datetime"] = pd.to_datetime(minute["datetime"], errors="coerce")
+            minute = minute.dropna(subset=["datetime", "close"]).sort_values("datetime")
+            if minute.empty:
                 continue
-            session_date = intraday["datetime"].dt.date.max()
-            last_dt = intraday["datetime"].iloc[-1]
+            session_date = minute["datetime"].dt.date.max()
+            last_dt = minute["datetime"].iloc[-1]
             prev = daily[daily["trade_date"].dt.date < session_date]
             prev_close = float(prev["rate_value"].iloc[-1]) if not prev.empty else None
-            last_price = float(intraday["close"].iloc[-1])
+            last_price = float(minute["close"].iloc[-1])
             quotes[key_short] = {
                 "price": last_price,
                 "pct": (last_price / prev_close - 1) * 100.0 if prev_close else None,
                 "session_date": session_date.isoformat(),
                 "data_time": last_dt.isoformat(),
+                "prev_close": prev_close,
             }
+            # 当日分钟数据（供 K 线可视化；接口返回多个交易日，只保留最新交易日 = 当日）
+            session_df = minute[minute["datetime"].dt.date == session_date]
+            intraday[key_short] = session_df[["datetime", "open", "high", "low", "close", "volume"]].copy()
+            # 当日 OHLC 汇总（供指标卡片展示）
+            ohlc = session_df.dropna(subset=["open", "high", "low", "close"])
+            if not ohlc.empty:
+                quotes[key_short]["day"] = {
+                    "open": float(ohlc["open"].iloc[0]),
+                    "high": float(ohlc["high"].max()),
+                    "low": float(ohlc["low"].min()),
+                    "close": float(ohlc["close"].iloc[-1]),
+                }
         except Exception:  # noqa: BLE001
             continue
 
@@ -606,6 +618,7 @@ def get_bond_futures_signal(code: str) -> dict:
         "nav_prev2": nav_prev2,
         "signal": signal,
         "market": _market_status(quotes),
+        "intraday": intraday,
     }
 
 

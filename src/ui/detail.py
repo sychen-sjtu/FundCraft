@@ -17,6 +17,7 @@ from src.ui import store
 from src.ui.charts import (
     build_bond_futures_change_chart,
     build_bond_futures_curve_chart,
+    build_bond_futures_intraday_chart,
     build_cumulative_vs_benchmark_chart,
     build_dividend_history_chart,
     build_drawdown_area_chart,
@@ -519,8 +520,11 @@ def _bond_cell(label: str, value_html: str, *, help_tip: str = "", full: bool = 
     )
 
 
-def _render_bond_metrics(code: str) -> None:
-    """固收+ 核心指标：单卡片 2 列宫格（年化/回撤 | 卡玛/规模 | 年限通栏），语义化着色。"""
+def _render_bond_metrics(code: str, *, title: str = "核心指标") -> None:
+    """债券基金核心指标：单卡片 2 列宫格（年化/回撤 | 卡玛/规模 | 年限通栏），语义化着色。
+
+    :param title: 卡片标题；固收+ 传「固收+ 核心指标」、债基传「债基 核心指标」。
+    """
     m = store.get_fund_bond_metrics(code)
 
     def _pct(value) -> str | None:
@@ -544,7 +548,7 @@ def _render_bond_metrics(code: str) -> None:
 
     card_html = (
         '<div class="fc-bond-card">'
-        '<div class="fc-bond-title">固收+ 核心指标</div>'
+        f'<div class="fc-bond-title">{title}</div>'
         '<div class="fc-bond-grid">'
         + _bond_cell("历史年化收益", _bond_value_html(ann, "%", ann_cls))
         + _bond_cell("最大回撤", _bond_value_html(mdd, "%", mdd_cls))
@@ -664,9 +668,94 @@ def _render_bond_signal_result(result: dict, code: str) -> None:
         unsafe_allow_html=True,
     )
 
+    # ---- 指标明细（指标1/2/3 逐项：是否满足 + 关键数值 + 原因） ----
+    indicators = signal.get("indicators")
+    if indicators:
+        rows_html = ""
+        for ind in indicators:
+            ok = bool(ind.get("ok"))
+            badge = "✅" if ok else "❌"
+            color = "#1F7A4D" if ok else "#B0B6BF"
+            rows_html += (
+                "<tr>"
+                f'<td style="padding:7px 10px;font-size:12px;color:#1F2329;white-space:nowrap;"><b>{ind.get("label", "")}</b></td>'
+                f'<td style="padding:7px 8px;font-size:13px;color:{color};font-weight:700;text-align:center;width:44px;">{badge}</td>'
+                f'<td style="padding:7px 10px;font-size:12px;color:#8A8F99;">{ind.get("detail", "")}</td>'
+                "</tr>"
+            )
+        st.markdown(
+            '<div class="fc-bond-card"><div class="fc-bond-title">指标明细（逐项判定）</div>'
+            '<table style="width:100%;border-collapse:collapse;border:1px solid #F0F0F0;">'
+            f"{rows_html}</table></div>",
+            unsafe_allow_html=True,
+        )
+
+    # ---- TF/T 当日 OHLC 汇总卡片（今开/最高/最低/昨收/现价+涨跌） ----
+    _render_ohlc_cards(result)
+
+    # ---- 当日盘中 K 线（用于预估的分钟数据） ----
+    intraday = result.get("intraday", {})
+    has_intraday = any(isinstance(df, pd.DataFrame) and not df.empty for df in intraday.values())
+    if has_intraday:
+        st.markdown(
+            '<div class="fc-bond-card"><div class="fc-bond-title">当日盘中 K 线（分钟数据）</div>'
+            '<div style="color:#8A8F99;font-size:12px;padding:0 2px 4px;">5 分钟 K 线 · 虚线=昨收/今开 · 顶部标注当前价与涨跌（红涨绿跌）</div></div>',
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(
+            build_bond_futures_intraday_chart(result),
+            width="stretch",
+            config=PLOTLY_CONFIG,
+            key=f"bf_intraday_{code}",
+        )
+
+
+def _render_ohlc_cards(result: dict) -> None:
+    """指标明细下方：TF / T 各一张当日 OHLC 汇总卡（今开/最高/最低/昨收/现价+涨跌）。
+
+    K 线图内不再叠 OHLC 文字（避免两子图重叠），数值统一放卡片展示。
+    """
+    col1, col2 = st.columns(2)
+    for col, key, label in ((col1, "tf", "TF(5年)"), (col2, "t", "T(10年)")):
+        quote = result.get(key, {})
+        day = quote.get("day")
+        price = quote.get("price")
+        pct = quote.get("pct")
+        prev = quote.get("prev_close")
+        with col:
+            if day is None or price is None:
+                st.markdown(
+                    f'<div class="fc-bond-card"><div class="fc-bond-title">{label}</div>'
+                    '<div class="fc-bond-value neutral">暂无数据</div></div>',
+                    unsafe_allow_html=True,
+                )
+                continue
+            if pct is None:
+                pct_cls, arrow, pct_txt = "neutral", "", "暂无"
+            else:
+                pct_cls = "up" if pct >= 0 else "down"
+                arrow = "▲" if pct >= 0 else "▼"
+                pct_txt = f"{arrow} {pct:+.2f}%"
+            head = (
+                f'<div class="fc-bond-title">{label}　<span class="fc-bond-value {pct_cls}" style="font-size:13px;">'
+                f'当前 {price:.3f}　{pct_txt}</span></div>'
+            )
+            prev_text = f"{prev:.3f}" if prev else "—"
+            card = (
+                '<div class="fc-bond-card">'
+                + head
+                + '<div class="fc-bond-grid">'
+                + _bond_cell("今开", f'<span class="fc-bond-value neutral">{day["open"]:.3f}</span>')
+                + _bond_cell("最高", f'<span class="fc-bond-value up">{day["high"]:.3f}</span>')
+                + _bond_cell("最低", f'<span class="fc-bond-value down">{day["low"]:.3f}</span>')
+                + _bond_cell("昨收", f'<span class="fc-bond-value neutral">{prev_text}</span>')
+                + "</div></div>"
+            )
+            st.markdown(card, unsafe_allow_html=True)
+
 
 def _render_bond_futures_signal(code: str) -> None:
-    """国债期货加仓信号（固收债基专用，bond_signal=true）：今日判断 + 历史曲线/涨跌/买点。
+    """国债期货加仓信号（panel=债基 专用）：今日判断 + 历史曲线/涨跌/买点。
 
     规则：条件1·优选 TF跌≤-0.10% / 条件1·强化 -0.10<TF≤-0.08%且T≤-0.15% /
     条件2·连跌 前2日净值收负且今日盘中TF仍跌。只给「建议申购/建议观望」，不带金额；
@@ -771,12 +860,12 @@ def render() -> None:
     # ---------- 基金评估（渐进式三层就绪度） ----------
     _render_evaluation(code)
 
-    # ---------- 固收+ 核心指标（历史年化/最大回撤/卡玛/年限/规模） ----------
-    if meta["panel"] == "固收":
-        _render_bond_metrics(code)
+    # ---------- 债券基金核心指标（历史年化/最大回撤/卡玛/年限/规模） ----------
+    if meta["panel"] in ("固收+", "债基"):
+        _render_bond_metrics(code, title=f"{meta['category']} 核心指标")
 
-    # ---------- 国债期货加仓信号（固收债基专用，bond_signal=true） ----------
-    if meta.get("bond_signal"):
+    # ---------- 国债期货加仓信号（panel=债基 专用） ----------
+    if meta["panel"] == "债基":
         _render_bond_futures_signal(code)
 
     # ---------- 时间范围胶囊（联动下方所有图表与指标） ----------
