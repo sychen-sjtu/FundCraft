@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import calendar
+import re
 from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -373,6 +374,210 @@ def get_funds_bond_comparison(codes: list[str]) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+# ---------- 债基 风控与持仓（panel=债基，如 007171） ----------
+def _drawdown_recoveries(ordered: pd.DataFrame, col: str) -> list[dict]:
+    """已收复回撤段列表：从峰值滑落到重新创新高的交易日跨度。
+
+    :return: [{start, end, days, max_dd}]，days=交易日数（收复=净值回到前峰），max_dd=该段最深回撤(%)。
+    只统计「已收复」的回撤段；当前仍处于回撤中（未收复）不计入。
+    """
+    nav = pd.to_numeric(ordered[col], errors="coerce").to_numpy(dtype=float)
+    dates = pd.to_datetime(ordered["nav_date"], errors="coerce").to_numpy()
+    n = len(nav)
+    peak_idx = 0
+    start_idx: int | None = None
+    depth_min = 0.0
+    recoveries: list[dict] = []
+    for i in range(n):
+        if not np.isfinite(nav[i]):
+            continue
+        if nav[i] >= nav[peak_idx]:
+            if start_idx is not None:
+                recoveries.append(
+                    {
+                        "start": dates[start_idx],
+                        "end": dates[i],
+                        "days": i - start_idx,
+                        "max_dd": depth_min,
+                    }
+                )
+                start_idx = None
+            peak_idx = i
+            depth_min = 0.0
+        else:
+            if start_idx is None:
+                start_idx = peak_idx
+                depth_min = (nav[i] / nav[peak_idx] - 1.0) * 100.0
+            else:
+                depth_min = min(depth_min, (nav[i] / nav[peak_idx] - 1.0) * 100.0)
+    return recoveries
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _bond_risk_metrics(url: str, key: str, code: str) -> dict:
+    """债基风控指标：近1年/全历史最大回撤 + 最长已收复回撤段（交易日）。
+
+    全部由落库复权净值派生（真实数据，无模拟）；拿不到 → None。
+    """
+    code = normalize_fund_code(code)
+    result = {"max_dd_1y": None, "max_dd_all": None, "recover_1y": None, "recover_all": None}
+    nav = _nav_history(url, key, code, None, None)
+    if nav is None or nav.empty:
+        return result
+    if "trade_date" in nav.columns:
+        nav = nav.rename(columns={"trade_date": "nav_date"})
+    ordered = nav.sort_values("nav_date").reset_index(drop=True).copy()
+    col = "adjusted_nav" if "adjusted_nav" in ordered.columns and ordered["adjusted_nav"].notna().any() else "unit_nav"
+    ordered[col] = pd.to_numeric(ordered[col], errors="coerce")
+    ordered = ordered.dropna(subset=["nav_date", col])
+    if ordered.empty:
+        return result
+    dd = build_drawdown_series(ordered, nav_col=col)
+    if dd.empty or "drawdown_pct" not in dd.columns:
+        return result
+    result["max_dd_all"] = float(dd["drawdown_pct"].min())
+    cutoff = pd.Timestamp(ordered["nav_date"].iloc[-1]) - pd.Timedelta(days=365)
+    y1 = dd[pd.to_datetime(dd["nav_date"]) >= cutoff]
+    if not y1.empty:
+        result["max_dd_1y"] = float(y1["drawdown_pct"].min())
+    rec = _drawdown_recoveries(ordered, col)
+    if rec:
+        result["recover_all"] = max(rec, key=lambda r: r["days"])
+        y1_rec = [r for r in rec if pd.Timestamp(r["end"]) >= cutoff]
+        if y1_rec:
+            result["recover_1y"] = max(y1_rec, key=lambda r: r["days"])
+    return result
+
+
+_BOND_CATEGORY_RULES = (
+    ("国债", "国债"),
+    ("国开", "国开债"),
+    ("进出", "政金债"),
+    ("农发", "政金债"),
+    ("转债", "可转债"),
+)
+
+
+def _bond_category(name: str) -> str:
+    """按债券名称前缀归类（接口无显式类型字段，靠名称推断；其余归信用债）。"""
+    for keyword, label in _BOND_CATEGORY_RULES:
+        if keyword in name:
+            return label
+    return "信用债"
+
+
+def _quarter_key(q: str) -> tuple[int, int]:
+    m = re.search(r"(\d{4})年(\d+)季度", str(q))
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _bond_holdings_profile(code: str) -> dict:
+    """债基底层安全性：akshare 最新报告期债券持仓按类别归类（缓存 1 小时）。
+
+    :return: {report_period, categories(相对占比), nav_pct(占净值), total_nav_pct,
+              count, no_stock, has_convertible}；拿不到 → {}。
+    """
+    code = normalize_fund_code(code)
+    try:
+        import akshare as ak
+    except Exception:  # noqa: BLE001
+        return {}
+    df = None
+    for year in (date.today().year, date.today().year - 1, date.today().year - 2):
+        try:
+            candidate = ak.fund_portfolio_bond_hold_em(symbol=code, date=str(year))
+        except Exception:  # noqa: BLE001
+            candidate = None
+        if candidate is not None and not candidate.empty and "季度" in candidate.columns:
+            df = candidate
+            break
+    if df is None:
+        return {}
+    latest_q = max(df["季度"].dropna().unique(), key=_quarter_key)
+    sub = df[df["季度"] == latest_q].copy()
+    sub["占净值比例"] = pd.to_numeric(sub["占净值比例"], errors="coerce").fillna(0.0)
+    total = float(sub["占净值比例"].sum())
+    cats: dict[str, float] = {}
+    for _, r in sub.iterrows():
+        label = _bond_category(str(r["债券名称"]))
+        cats[label] = cats.get(label, 0.0) + float(r["占净值比例"])
+    order = sorted(cats.items(), key=lambda kv: -kv[1])
+    categories = [(label, (v / total * 100.0) if total else 0.0) for label, v in order]
+    # 股票持仓（空 → 不含股票）
+    no_stock = None
+    try:
+        year_str = re.search(r"(\d{4})", str(latest_q))
+        stocks = ak.fund_portfolio_hold_em(symbol=code, date=year_str.group(1)) if year_str else None
+        no_stock = bool(stocks is None or stocks.empty)
+    except Exception:  # noqa: BLE001
+        no_stock = None
+    return {
+        "report_period": str(latest_q).replace("债券投资明细", "").strip(),
+        "categories": [(c, round(v, 1)) for c, v in categories],
+        "nav_pct": [(c, round(v, 2)) for c, v in order],
+        "total_nav_pct": round(total, 2),
+        "count": int(len(sub)),
+        "no_stock": no_stock,
+        "has_convertible": "可转债" in cats,
+    }
+
+
+def get_bond_risk_comparison(codes: list[str]) -> pd.DataFrame:
+    """债基对比：近1年/全历史最大回撤 + 最长回撤修复天数 + 底层安全性（类别占比）。
+
+    回撤来自落库复权净值；持仓来自 akshare（缓存 1 小时）。拿不到 → None（UI 显示「暂无」）。
+    """
+    url, key = _credentials()
+    overview = get_all_funds_overview()
+    by_code = {str(r.fund_code): r for r in overview.itertuples(index=False)}
+    rows = []
+    for code in codes:
+        code = normalize_fund_code(code)
+        rm = _bond_risk_metrics(url, key, code)
+        hp = _bond_holdings_profile(code)
+        ov = by_code.get(code)
+        r1y = rm.get("recover_1y") or {}
+        rall = rm.get("recover_all") or {}
+        # 底层安全性文案
+        holdings_summary, holdings_note = "—", "暂无持仓数据"
+        if hp:
+            parts = [f"{c} {v:.0f}%" for c, v in hp.get("categories", [])]
+            holdings_summary = " · ".join(parts) if parts else "—"
+            flags = []
+            if hp.get("no_stock") is True:
+                flags.append("不含股票")
+            elif hp.get("no_stock") is False:
+                flags.append("含股票")
+            if hp.get("has_convertible"):
+                flags.append("含可转债")
+            else:
+                flags.append("不含可转债")
+            holdings_note = (
+                f"披露债券持仓 · {hp.get('report_period', '')} · "
+                f"占净值合计 {hp.get('total_nav_pct', 0):.1f}% · {' · '.join(flags)}"
+            )
+        rows.append(
+            {
+                "fund_code": code,
+                "fund_name": str(ov.fund_name) if ov is not None else "",
+                "max_drawdown_1y": rm.get("max_dd_1y"),
+                "max_drawdown_all": rm.get("max_dd_all"),
+                "recover_1y_days": r1y.get("days"),
+                "recover_1y_range": f"{str(r1y.get('start'))[:10]} → {str(r1y.get('end'))[:10]}" if r1y.get("start") is not None else None,
+                "recover_all_days": rall.get("days"),
+                "holdings_summary": holdings_summary,
+                "holdings_note": holdings_note,
+            }
+        )
+    df = pd.DataFrame(rows)
+    # 混合 None/int 的列会被 pandas 转成 float64（None→NaN），统一还原为 None 供下游判空
+    for col in ("max_drawdown_1y", "max_drawdown_all", "recover_1y_days", "recover_all_days", "recover_1y_range"):
+        if col in df.columns:
+            df[col] = df[col].where(pd.notna(df[col]), None)
+    return df
 
 
 def _compute_period_returns_from(frame: pd.DataFrame, periods: list[str]) -> dict[str, float | None]:

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import pandas as pd
 import streamlit as st
 
 from src.config import load_fund_categories
@@ -59,6 +60,63 @@ def _render_bond_comparison(codes: list[str]) -> None:
         "<th class='num'>基金年限</th><th class='num'>基金规模</th></tr></thead>"
         f"<tbody>{''.join(rows_html)}</tbody></table></div>",
         unsafe_allow_html=True,
+    )
+
+
+def _render_bond_risk_comparison(codes: list[str]) -> None:
+    """债基 风控与持仓对比表：近1年最大回撤 / 最长回撤修复天数 / 底层安全性（类别占比）。
+
+    回撤来自落库复权净值真实数据；底层安全性来自 akshare 最新报告期债券持仓（按类别归类）。
+    """
+    data = store.get_bond_risk_comparison(codes)
+    if data.empty:
+        st.caption("暂无对比数据。")
+        return
+
+    def _dd_cell(value) -> str:
+        if value is None or pd.isna(value):
+            return '<span class="fc-flat fc-num">—</span>'
+        value = float(value)
+        cls = "fc-down" if value < 0 else "fc-flat"
+        return f'<span class="{cls} fc-num">{value:.2f}%</span>'
+
+    def _days_cell(days, range_txt) -> str:
+        if days is None or pd.isna(days):
+            return '<span class="fc-flat fc-num">—</span>'
+        note = f"<div style='font-size:11px;color:#B0B6BF;'>{range_txt}</div>" if range_txt else ""
+        return f'<span class="fc-num">{int(days)} 交易日</span>{note}'
+
+    rows_html = []
+    for row in data.itertuples(index=False):
+        name = str(row.fund_name) if row.fund_name else str(row.fund_code)
+        dd1y_note = (
+            f"<div style='font-size:11px;color:#B0B6BF;'>全历史 {row.max_drawdown_all:.2f}%</div>"
+            if row.max_drawdown_all is not None and not pd.isna(row.max_drawdown_all)
+            else ""
+        )
+        recover_note = ""
+        if row.recover_all_days is not None and not pd.isna(row.recover_all_days):
+            recover_note = f"<div style='font-size:11px;color:#B0B6BF;'>近1年最长 · 全历史最长 {int(row.recover_all_days)}</div>"
+        elif row.recover_1y_days is not None and not pd.isna(row.recover_1y_days):
+            recover_note = f"<div style='font-size:11px;color:#B0B6BF;'>近1年最长</div>"
+        holdings_note = f"<div style='font-size:11px;color:#B0B6BF;'>{row.holdings_note}</div>"
+        rows_html.append(
+            "<tr>"
+            f"<td><b>{name}</b><div style='font-size:11px;color:#B0B6BF;'>{row.fund_code}</div></td>"
+            f"<td class='num'>{_dd_cell(row.max_drawdown_1y)}{dd1y_note}</td>"
+            f"<td class='num'>{_days_cell(row.recover_1y_days, row.recover_1y_range)}{recover_note}</td>"
+            f"<td><span class='fc-num'>{row.holdings_summary}</span>{holdings_note}</td>"
+            "</tr>"
+        )
+    st.markdown(
+        '<div class="fc-nav-table-wrap"><table class="fc-nav-table">'
+        "<thead><tr><th>基金</th><th class='num'>近1年最大回撤</th><th class='num'>最长回撤修复天数</th>"
+        "<th>底层安全性（类别占比）</th></tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "回撤/修复天数来自落库复权净值（真实数据）· 底层安全性=akshare 最新报告期披露债券持仓按名称归类（国开/国债/政金/信用/可转债）"
     )
 
 
@@ -126,3 +184,6 @@ def render() -> None:
         # 固收+ 核心指标对比表（默认加载）
         if category == "固收+":
             _render_bond_comparison([str(r.fund_code) for r in group.itertuples(index=False)])
+        # 债基 风控与持仓对比表（最大回撤/回撤修复天数/底层安全性类别占比）
+        if category == "债基":
+            _render_bond_risk_comparison([str(r.fund_code) for r in group.itertuples(index=False)])
