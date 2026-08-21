@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -37,6 +38,7 @@ from src.storage.supabase_store import (
     create_supabase_client,
     delete_stale_fund_tracking_index,
     delete_stale_index_master,
+    fetch_nav_history,
     insert_sync_log,
     list_fund_profiles,
     list_watermarks,
@@ -132,12 +134,21 @@ def _since_date(wm: dict, key: tuple[str, str]) -> str | None:
     return (last - pd.Timedelta(days=OVERLAP_DAYS)).date().isoformat()
 
 
+def _last_adjusted_nav(client, code: str, before: str) -> float | None:
+    """读取指定日期之前最后一行已入库的复权净值，作为增量复权接续锚点（无则 None）。"""
+    prev = fetch_nav_history(client, code, end_date=before)
+    if prev.empty or "adjusted_nav" not in prev.columns:
+        return None
+    series = prev["adjusted_nav"].dropna()
+    return float(series.iloc[-1]) if not series.empty else None
+
+
 def _refresh_funds(client, fund_codes: list[str], progress: SyncProgress | None = None) -> list[dict]:
     """基金层：净值(复权) + 分红 + 档案 + 水位。
 
-    增量策略（数据为空 → 全量；非空 → 从「水位 - OVERLAP_DAYS」起补拉）：
-    - 净值：接口只能返回全历史，但只 upsert 水位之后的行（减少写量）。
-    - 分红：全部基金合并一次抓取，起始年份从水位回退 1 年，避免逐基金重复全市场扫描。
+    增量策略（数据为空 → 全量；非空 → 至少拉「水位 - OVERLAP_DAYS」重叠窗口）：
+    - 净值：无论水位新旧都至少拉 OVERLAP 窗口，兜底「净值数据修正」（避免完全跳过漏掉调整）；首次才全量。
+    - 分红：全部基金合并一次抓取，至少扫「当前年」兜底分红修正；有水位回退 1 年，空则 2015 全量。
     - 档案：静态数据，档案表里已存在的基金不重复抓取（避免重复下载全市场列表 / 雪球逐只查询）。
     """
     from src.fetchers.akshare_fund_nav import derive_adjusted_nav
@@ -145,26 +156,57 @@ def _refresh_funds(client, fund_codes: list[str], progress: SyncProgress | None 
     results: list[dict] = []
     wm = _watermark_map(client)
 
-    # ---- 净值（每只；接口全历史，但只写增量行） ----
+    # ---- 净值（增量：有水位则按「水位-OVERLAP_DAYS」只拉增量窗口，网络不再全量） ----
     for code in fund_codes:
         if progress:
             progress.step(f"基金 {code}：净值 / 复权")
         try:
-            nav = derive_adjusted_nav(fetch_fund_nav_history(code))
+            last = wm.get(("fund", code))
             since = _since_date(wm, ("fund", code))
+            if since is None:
+                # 首次：akshare 全历史 + 从头推导复权
+                nav = derive_adjusted_nav(fetch_fund_nav_history(code))
+            else:
+                # 增量：至少拉「水位-OVERLAP_DAYS」重叠窗口（兜底最近净值修正）+ 接续锚点复权
+                before = (pd.Timestamp(since) - pd.Timedelta(days=1)).date().isoformat()
+                anchor = _last_adjusted_nav(client, code, before=before)
+                if anchor is None:
+                    nav = derive_adjusted_nav(fetch_fund_nav_history(code))
+                else:
+                    try:
+                        nav = derive_adjusted_nav(
+                            fetch_fund_nav_history(code, start_date=since),
+                            prev_adjusted_nav=anchor,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"WARN: 增量拉取 {code} 失败，回退全量: {exc}")
+                        nav = derive_adjusted_nav(fetch_fund_nav_history(code))
+
+            if nav.empty:
+                results.append({"entity": "fund", "fund_code": code, "nav_rows": 0, "note": "无新增净值"})
+                continue
             n = upsert_nav_history(client, nav, since_date=since)
-            if not nav.empty and "nav_date" in nav.columns:
-                upsert_watermark(client, "fund", code, nav["nav_date"].max(), source="fund_open_fund_info_em")
+            # 水位只前进不倒退（若本次窗口未覆盖到原水位，保留原值，避免误回退）
+            max_date = nav["nav_date"].max()
+            if last is not None:
+                max_date = max(pd.Timestamp(max_date), last)
+            upsert_watermark(client, "fund", code, max_date, source="fund_open_fund_info_em")
             results.append({"entity": "fund", "fund_code": code, "nav_rows": n})
         except Exception as exc:  # noqa: BLE001
             results.append({"entity": "fund", "fund_code": code, "error": str(exc)})
 
-    # ---- 分红（合并一次抓取；起始年份按水位回退 1 年，空则 2015 起全量） ----
+    # ---- 分红（合并一次抓取；至少扫「当前年」兜底修正，有水位回退 1 年，空则 2015 全量） ----
     if progress:
         progress.step(f"分红：{len(fund_codes)} 只基金合并抓取")
     try:
         years = [wm.get(("fund", code)).year for code in fund_codes if wm.get(("fund", code)) is not None]
-        start_year = max(2015, min(years) - 1) if years else 2015
+        all_current = bool(years) and all(
+            wm.get(("fund", code)) is not None
+            and wm[("fund", code)].date() >= date.today() - timedelta(days=1)
+            for code in fund_codes
+        )
+        # 水位均最新 → 只扫当前年（轻量兜底分红修正）；否则按水位回退 1 年；无水位全量
+        start_year = datetime.now().year if all_current else (max(2015, min(years) - 1) if years else 2015)
         div = fetch_fund_dividends_ak(fund_codes, start_year=start_year)
         n_div = upsert_fund_dividends(client, div)
         if n_div:
@@ -288,14 +330,15 @@ def _refresh_valuation(
                 if index_code == "H30269":
                     official_min = official["trade_date"].min()
                     derived_max = None
-                    rows = _fetch_all_rows(
+                    rows = (
                         client.table("index_valuation_history")
                         .select("trade_date")
                         .eq("index_code", "H30269")
                         .eq("source", "derived")
                         .order("trade_date", desc=True)
                         .limit(1)
-                    )
+                        .execute()
+                    ).data or []
                     if rows:
                         derived_max = pd.Timestamp(rows[0]["trade_date"])
                     need_derived = derived_max is None or derived_max < official_min - pd.Timedelta(days=30)

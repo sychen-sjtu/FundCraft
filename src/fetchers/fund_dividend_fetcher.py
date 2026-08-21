@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from functools import lru_cache
 from typing import Iterable
 
 import akshare as ak
@@ -14,25 +15,30 @@ from src.fetchers.akshare_fund_nav import normalize_fund_code
 DIVIDEND_FETCH_START_YEAR = 2015
 
 
-def _resolve_fund_types(target_codes: set[str]) -> set[str]:
-    """从 fund_name_em 解析目标基金的「基金类型」集合，用于缩小分红查询范围。
-
-    fund_fh_em 若用 typ=""（全部类型）会翻页拉取全市场分红，非常慢；只查询
-    目标基金所属类型可大幅减少请求量。
-    """
-    types: set[str] = set()
+@lru_cache(maxsize=8)
+def _resolve_fund_types_cached(codes: frozenset[str]) -> frozenset[str]:
+    """从 fund_name_em 解析目标基金的「基金类型」集合（lru_cache：基金类型为静态数据）。"""
+    target_codes = set(codes)
     try:
         names_df = ak.fund_name_em()
     except Exception as exc:  # noqa: BLE001
         print(f"WARN: fund_name_em failed, fallback to typ='' : {exc}")
-        return types
+        return frozenset()
 
     if names_df.empty or not {"基金代码", "基金类型"}.issubset(names_df.columns):
-        return types
+        return frozenset()
 
     sub = names_df[names_df["基金代码"].astype(str).str.strip().apply(normalize_fund_code).isin(target_codes)]
-    types = {str(value).strip() for value in sub["基金类型"].dropna() if str(value).strip()}
-    return types
+    return frozenset({str(value).strip() for value in sub["基金类型"].dropna() if str(value).strip()})
+
+
+def _resolve_fund_types(target_codes: set[str]) -> set[str]:
+    """从 fund_name_em 解析目标基金的「基金类型」集合，用于缩小分红查询范围。
+
+    fund_fh_em 若用 typ=""（全部类型）会翻页拉取全市场分红，非常慢；只查询
+    目标基金所属类型可大幅减少请求量。结果经 lru_cache 缓存（基金类型静态）。
+    """
+    return set(_resolve_fund_types_cached(frozenset(target_codes)))
 
 
 def fetch_fund_dividends(

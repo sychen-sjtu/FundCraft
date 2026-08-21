@@ -94,6 +94,35 @@ create table if not exists public.fund_daily_factors (
     primary key (fund_code, trade_date)
 );
 
+-- 2.5 基金低频快照指标（akshare 派生，低频变化：规模日更、持仓季度更）
+--     用途：总览固收+/债基对比表读这里，避免每次冷缓存实时调 akshare（雪球/东财）
+create table if not exists public.fund_snapshot_metrics (
+    fund_code            text        not null,
+    fund_scale           numeric     null,   -- 基金规模（亿元，雪球）
+    scale_updated_at     timestamptz null,   -- 规模抓取时间
+    bond_report_period   text        null,   -- 债券持仓报告期（如 2026年2季度）
+    bond_categories      jsonb       null,   -- 债券类别相对占比 [{label,pct}]
+    bond_nav_pct         jsonb       null,   -- 债券类别占净值 [{label,pct}]
+    bond_total_nav_pct   numeric     null,   -- 披露债券持仓占净值合计(%)
+    bond_count           integer     null,   -- 披露债券只数
+    bond_no_stock        boolean     null,   -- 是否不含股票
+    bond_has_convertible boolean     null,   -- 是否含可转债
+    holdings_updated_at  timestamptz null,   -- 持仓抓取时间
+    updated_at           timestamptz not null default now(),
+    primary key (fund_code)
+);
+
+-- 2.6 快照表扩展：持久化 nav 派生指标（年化/回撤/卡玛/年限 + 债基回撤/修复天数），
+--     让总览对比表冷缓存也直接读库，不再每次重启拉全历史净值
+alter table public.fund_snapshot_metrics
+    add column if not exists fund_metrics jsonb;
+alter table public.fund_snapshot_metrics
+    add column if not exists fund_metrics_updated_at timestamptz;
+alter table public.fund_snapshot_metrics
+    add column if not exists bond_metrics jsonb;
+alter table public.fund_snapshot_metrics
+    add column if not exists bond_metrics_updated_at timestamptz;
+
 
 -- ----------------------------------------------------------------------------
 -- 三、预留表（当前策略不启用，供未来指数级数据使用）

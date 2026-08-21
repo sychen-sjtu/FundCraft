@@ -54,7 +54,7 @@ def _render_server_status() -> None:
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        render_metric_card("数据库行数", f'{status["db_rows"]:,}')
+        render_metric_card("数据库行数(估算)", f'{status["db_rows"]:,}')
     with c2:
         render_metric_card("数据表数", f'{status["tables"]}')
     with c3:
@@ -71,7 +71,7 @@ def _render_server_status() -> None:
             render_metric_card(label, f"{value}%" if value is not None else "暂无")
 
     st.caption(
-        f'实例：{status["host"]} · 数据库行数/表数为 Supabase 真实值；'
+        f'实例：{status["host"]} · 数据库行数为 Supabase Planner 估算值（非精确）；'
         "CPU/内存/磁盘为 Supabase 基础设施指标，需 Management API token，暂显示「暂无」。"
     )
 

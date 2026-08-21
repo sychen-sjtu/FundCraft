@@ -759,7 +759,26 @@ def build_bond_futures_intraday_chart(data: dict) -> go.Figure:
         margin=dict(l=4, r=4, t=30, b=8),
         dragmode=False,
     )
-    # shared_xaxes 时底部子图轴名为 xaxis2，必须对所有 x 轴统一关闭缩略条
-    figure.update_xaxes(rangeslider_visible=False)
+    # shared_xaxes 时底部子图轴名为 xaxis2，必须对所有 x 轴统一关闭缩略条。
+    # 午休 11:30~13:00 无交易：用 rangebreaks 把大部分压缩掉，只留中间 12:00~12:15 一小段
+    # 作为「休市」提示（否则 11:30 与 13:00 两根 K 线直接贴一起，看不出午休）。
+    # 实测：pattern="hour" 配 "HH:MM" 字符串 bounds 不生效（该 pattern 只认整数小时）；
+    # 而盘中图是单日图，直接用「当天完整时间戳」bounds 最可靠
+    session_date = None
+    for _df in intraday.values():
+        if not _df.empty and "datetime" in _df.columns:
+            s = pd.to_datetime(_df["datetime"], errors="coerce").dt.date.max()
+            if s is not None:
+                session_date = s
+                break
+    rangebreaks = (
+        [
+            dict(bounds=[f"{session_date} 11:30", f"{session_date} 12:00"]),
+            dict(bounds=[f"{session_date} 12:15", f"{session_date} 13:00"]),
+        ]
+        if session_date is not None
+        else None
+    )
+    figure.update_xaxes(rangeslider_visible=False, rangebreaks=rangebreaks)
     figure.update_xaxes(row=n_rows, col=1, tickformat="%H:%M", showgrid=False)
     return figure

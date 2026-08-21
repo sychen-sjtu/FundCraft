@@ -644,7 +644,7 @@ def _render_bond_signal_result(result: dict, code: str) -> None:
     nav_text = "、".join(f"{v:+.2f}%" for v in nav_prev2) if nav_prev2 else "暂无"
     card_html = (
         '<div class="fc-bond-card">'
-        '<div class="fc-bond-title">今日盘中行情（14:30 判断）</div>'
+        '<div class="fc-bond-title">今日盘中行情</div>'
         '<div class="fc-bond-grid">'
         + _bond_quote_cell("TF(5年)", tf)
         + _bond_quote_cell("T(10年)", t)
@@ -794,7 +794,7 @@ def _render_bond_futures_signal(code: str) -> None:
 
     # 今日盘中信号（按钮触发，实时拉取，结果存 session_state 防重跑丢失）
     check_key = f"bf_check_{sel_code}"
-    if st.button("🔍 现在检查（14:30 盘中判断）", key=check_key, use_container_width=True):
+    if st.button("🔍 现在检查", key=check_key, use_container_width=True):
         with st.spinner("正在拉取 TF/T 盘中行情…"):
             try:
                 st.session_state[f"bf_result_{sel_code}"] = store.get_bond_futures_signal(sel_code)

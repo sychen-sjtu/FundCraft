@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import calendar
 import re
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
@@ -40,10 +40,12 @@ from src.storage.supabase_store import (
     _fetch_all_rows,
     create_supabase_client,
     fetch_fund_dividends,
+    fetch_fund_snapshot_metrics,
     fetch_macro_rates,
     fetch_nav_history,
     list_fund_profiles,
     list_watermarks,
+    upsert_fund_snapshot_metrics,
 )
 
 
@@ -187,8 +189,9 @@ def _strategy_factors(url: str, key: str, code: str) -> pd.DataFrame:
     return frame
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def _sync_jobs(url: str, key: str) -> pd.DataFrame:
+    """最近同步任务日志（ttl=300；刷新后由 _invalidate_caches 主动清除，故可放宽）。"""
     response = (
         _client_for(url, key)
         .table("sync_job")
@@ -278,9 +281,31 @@ def get_nav_history_with_cumulative(code: str, range_key: str = "近1年") -> pd
     return _nav_with_cumulative(url, key, normalize_fund_code(code), start, end)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fund_scale(code: str) -> float | None:
-    """基金最新规模（亿元）。akshare 雪球档案真实数据；失败返回 None（界面显示「暂无」）。"""
+# 快照指标新鲜度（秒）：基金规模日更 → 24h；债券持仓季度更 → 7 天；
+# nav 派生指标（年化/回撤/卡玛/年限/回撤修复）随净值日更 → 24h
+_SCALE_TTL_SECONDS = 24 * 3600
+_HOLDINGS_TTL_SECONDS = 7 * 24 * 3600
+_METRICS_TTL_SECONDS = 24 * 3600
+
+
+def _row_fresh(row: dict, ttl_seconds: int, ts_col: str = "updated_at") -> bool:
+    """快照指标是否新鲜（距抓取时间 < ttl 秒）；时间戳缺失/解析失败视为不新鲜。"""
+    ts = row.get(ts_col) or row.get("updated_at")
+    if not ts:
+        return False
+    try:
+        stamp = pd.Timestamp(ts)
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize(_BJ_TZ)
+        else:
+            stamp = stamp.tz_convert(_BJ_TZ)
+        return (datetime.now(_BJ_TZ) - stamp).total_seconds() < ttl_seconds
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _fetch_scale_akshare(code: str) -> float | None:
+    """基金最新规模（亿元）：akshare 雪球档案；失败返回 None。"""
     try:
         import akshare as ak
         import re
@@ -303,13 +328,45 @@ def _fund_scale(code: str) -> float | None:
         return None
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fund_scale(url: str, key: str, code: str) -> float | None:
+    """基金最新规模（亿元）。优先读 Supabase fund_snapshot_metrics（24h 内新鲜），
+    否则调 akshare 雪球并回写（低频变化，持久化后冷缓存也秒开）。"""
+    code = normalize_fund_code(code)
+    client = None
+    try:
+        client = _client_for(url, key)
+        row = fetch_fund_snapshot_metrics(client, code)
+        if row is not None and row.get("fund_scale") is not None and _row_fresh(row, _SCALE_TTL_SECONDS, "scale_updated_at"):
+            return float(row["fund_scale"])
+    except Exception:  # noqa: BLE001 - 快照表未建/读取失败 → 回退 akshare
+        pass
+    scale = _fetch_scale_akshare(code)
+    if scale is not None and client is not None:
+        try:
+            upsert_fund_snapshot_metrics(
+                client,
+                {"fund_code": code, "fund_scale": scale, "scale_updated_at": datetime.now(_BJ_TZ).isoformat()},
+            )
+        except Exception:  # noqa: BLE001 - 回写失败不影响展示
+            pass
+    return scale
+
+
 def get_fund_bond_metrics(code: str) -> dict:
+    """固收+/债基 核心指标（供详情页与对比表）。年化/回撤/卡玛/年限来自复权净值，
+    规模来自 fund_snapshot_metrics（持久化，冷缓存也快）。"""
+    url, key = _credentials()
+    return _fund_bond_metrics(url, key, normalize_fund_code(code))
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fund_bond_metrics(url: str, key: str, code: str) -> dict:
     """固收+ 核心指标：历史年化收益 / 最大回撤 / 卡玛比率 / 基金年限 / 基金规模（亿元）。
 
-    年化/回撤/卡玛/年限全部来自复权净值真实数据（基金年限 = 首末净值跨度）；
-    基金规模来自 akshare 雪球档案（缓存 1 小时）。拿不到 → None（界面显示「暂无」，绝不模拟）。
+    优先读快照表 fund_metrics（24h 内新鲜）→ 冷缓存也直接读库，不再每次重启拉全历史净值；
+    否则从全历史复权净值计算并回写。拿不到 → None（界面显示「暂无」，绝不模拟）。
     """
-    code = normalize_fund_code(code)
     result = {
         "annualized_return": None,
         "max_drawdown": None,
@@ -318,8 +375,17 @@ def get_fund_bond_metrics(code: str) -> dict:
         "fund_scale": None,
         "inception_year": None,
     }
+    code = normalize_fund_code(code)
+    client = None
     try:
-        nav = get_nav_history(code, "全部")
+        client = _client_for(url, key)
+        row = fetch_fund_snapshot_metrics(client, code)
+        if row is not None and row.get("fund_metrics") and _row_fresh(row, _METRICS_TTL_SECONDS, "fund_metrics_updated_at"):
+            return {**result, **row["fund_metrics"]}
+    except Exception:  # noqa: BLE001 - 快照表未建/读取失败 → 回退计算
+        pass
+    try:
+        nav = _nav_history(url, key, code, None, None)
         if nav is not None and not nav.empty:
             ordered = nav.sort_values("nav_date").reset_index(drop=True)
             col = "adjusted_nav" if "adjusted_nav" in ordered.columns and ordered["adjusted_nav"].notna().any() else "unit_nav"
@@ -341,23 +407,48 @@ def get_fund_bond_metrics(code: str) -> dict:
             if result["annualized_return"] is not None and result["max_drawdown"] is not None and result["max_drawdown"] < 0:
                 result["calmar_ratio"] = result["annualized_return"] / abs(result["max_drawdown"])
 
-        result["fund_scale"] = _fund_scale(code)
+        result["fund_scale"] = _fund_scale(url, key, code)
     except Exception:  # noqa: BLE001 - 单基金指标失败不阻塞页面
         pass
+    if client is not None:
+        try:
+            upsert_fund_snapshot_metrics(
+                client,
+                {"fund_code": code, "fund_metrics": result, "fund_metrics_updated_at": datetime.now(_BJ_TZ).isoformat()},
+            )
+        except Exception:  # noqa: BLE001 - 回写失败不影响展示
+            pass
     return result
 
 
-def get_funds_bond_comparison(codes: list[str]) -> pd.DataFrame:
-    """固收+ 基金核心指标对比（历史年化/近1月/近3月/最大回撤/卡玛/年限/规模）。
-
-    年化等来自 get_fund_bond_metrics（真实数据）；近1月/近3月复用总览缓存。
-    """
-    overview = get_all_funds_overview()
+@st.cache_data(ttl=1800, show_spinner=False)
+def _funds_bond_comparison(url: str, key: str, codes: tuple[str, ...]) -> pd.DataFrame:
+    """固收+ 核心指标对比（缓存 30 分钟）。批量读快照行：新鲜则直接重建（冷缓存也秒开）。"""
+    overview = _all_funds_overview(url, key, tuple(codes))
     by_code = {str(r.fund_code): r for r in overview.itertuples(index=False)}
+    snapshot: dict[str, dict] = {}
+    try:
+        client = _client_for(url, key)
+        data = _fetch_all_rows(
+            client.table("fund_snapshot_metrics")
+            .select("*")
+            .in_("fund_code", [normalize_fund_code(c) for c in codes])
+        )
+        snapshot = {normalize_fund_code(str(r["fund_code"])): r for r in data}
+    except Exception:  # noqa: BLE001 - 快照表未建/读取失败 → 走单只
+        pass
     rows = []
     for code in codes:
         code = normalize_fund_code(code)
-        m = get_fund_bond_metrics(code)
+        row = snapshot.get(code)
+        if row is not None and row.get("fund_metrics") and _row_fresh(row, _METRICS_TTL_SECONDS, "fund_metrics_updated_at"):
+            m = {
+                "annualized_return": None, "max_drawdown": None, "calmar_ratio": None,
+                "fund_age_years": None, "fund_scale": None, "inception_year": None,
+                **row["fund_metrics"],
+            }
+        else:
+            m = _fund_bond_metrics(url, key, code)
         ov = by_code.get(code)
         rows.append(
             {
@@ -374,6 +465,12 @@ def get_funds_bond_comparison(codes: list[str]) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def get_funds_bond_comparison(codes: list[str]) -> pd.DataFrame:
+    """固收+ 基金核心指标对比（历史年化/近1月/近3月/最大回撤/卡玛/年限/规模）。"""
+    url, key = _credentials()
+    return _funds_bond_comparison(url, key, tuple(normalize_fund_code(c) for c in codes))
 
 
 # ---------- 债基 风控与持仓（panel=债基，如 007171） ----------
@@ -419,10 +516,19 @@ def _drawdown_recoveries(ordered: pd.DataFrame, col: str) -> list[dict]:
 def _bond_risk_metrics(url: str, key: str, code: str) -> dict:
     """债基风控指标：近1年/全历史最大回撤 + 最长已收复回撤段（交易日）。
 
-    全部由落库复权净值派生（真实数据，无模拟）；拿不到 → None。
+    优先读快照表 bond_metrics（24h 内新鲜）→ 冷缓存也直接读库；否则从全历史复权净值
+    计算并回写。全部由落库复权净值派生（真实数据，无模拟）；拿不到 → None。
     """
     code = normalize_fund_code(code)
     result = {"max_dd_1y": None, "max_dd_all": None, "recover_1y": None, "recover_all": None}
+    client = None
+    try:
+        client = _client_for(url, key)
+        row = fetch_fund_snapshot_metrics(client, code)
+        if row is not None and row.get("bond_metrics") and _row_fresh(row, _METRICS_TTL_SECONDS, "bond_metrics_updated_at"):
+            return {**result, **row["bond_metrics"]}
+    except Exception:  # noqa: BLE001 - 快照表未建/读取失败 → 回退计算
+        pass
     nav = _nav_history(url, key, code, None, None)
     if nav is None or nav.empty:
         return result
@@ -448,6 +554,26 @@ def _bond_risk_metrics(url: str, key: str, code: str) -> dict:
         y1_rec = [r for r in rec if pd.Timestamp(r["end"]) >= cutoff]
         if y1_rec:
             result["recover_1y"] = max(y1_rec, key=lambda r: r["days"])
+    if client is not None and (result["max_dd_all"] is not None or result["recover_all"] is not None):
+        try:
+            # 持久化：dict 内 Timestamp/np.datetime64/np.float64 → JSON 可序列化
+            def _jsonable(v):
+                if isinstance(v, dict):
+                    return {k: _jsonable(x) for k, x in v.items()}
+                if isinstance(v, pd.Timestamp) or isinstance(v, np.datetime64):
+                    return pd.Timestamp(v).isoformat()
+                if isinstance(v, np.floating):
+                    return float(v)
+                if isinstance(v, np.integer):
+                    return int(v)
+                return v
+
+            upsert_fund_snapshot_metrics(
+                client,
+                {"fund_code": code, "bond_metrics": _jsonable(result), "bond_metrics_updated_at": datetime.now(_BJ_TZ).isoformat()},
+            )
+        except Exception:  # noqa: BLE001 - 回写失败不影响展示
+            pass
     return result
 
 
@@ -473,14 +599,12 @@ def _quarter_key(q: str) -> tuple[int, int]:
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _bond_holdings_profile(code: str) -> dict:
-    """债基底层安全性：akshare 最新报告期债券持仓按类别归类（缓存 1 小时）。
+def _fetch_holdings_akshare(code: str) -> dict:
+    """债基底层安全性：akshare 最新报告期债券持仓按类别归类。拿不到 → {}。
 
     :return: {report_period, categories(相对占比), nav_pct(占净值), total_nav_pct,
-              count, no_stock, has_convertible}；拿不到 → {}。
+              count, no_stock, has_convertible}。
     """
-    code = normalize_fund_code(code)
     try:
         import akshare as ak
     except Exception:  # noqa: BLE001
@@ -525,19 +649,81 @@ def _bond_holdings_profile(code: str) -> dict:
     }
 
 
-def get_bond_risk_comparison(codes: list[str]) -> pd.DataFrame:
-    """债基对比：近1年/全历史最大回撤 + 最长回撤修复天数 + 底层安全性（类别占比）。
+def _holdings_from_row(row: dict) -> dict:
+    """从快照行重建债基持仓 dict（对应 _fetch_holdings_akshare 返回结构）。"""
+    return {
+        "report_period": row.get("bond_report_period"),
+        "categories": [(c, v) for c, v in (row.get("bond_categories") or [])],
+        "nav_pct": [(c, v) for c, v in (row.get("bond_nav_pct") or [])],
+        "total_nav_pct": float(row["bond_total_nav_pct"]) if row.get("bond_total_nav_pct") is not None else 0.0,
+        "count": row.get("bond_count"),
+        "no_stock": row.get("bond_no_stock"),
+        "has_convertible": row.get("bond_has_convertible"),
+    }
 
-    回撤来自落库复权净值；持仓来自 akshare（缓存 1 小时）。拿不到 → None（UI 显示「暂无」）。
-    """
-    url, key = _credentials()
-    overview = get_all_funds_overview()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _bond_holdings_profile(url: str, key: str, code: str) -> dict:
+    """债基底层安全性：优先读 Supabase fund_snapshot_metrics（7 天内新鲜），
+    否则调 akshare 东财并回写（持仓季度更，持久化后冷缓存也秒开）。"""
+    code = normalize_fund_code(code)
+    client = None
+    try:
+        client = _client_for(url, key)
+        row = fetch_fund_snapshot_metrics(client, code)
+        if row is not None and row.get("bond_report_period") and _row_fresh(row, _HOLDINGS_TTL_SECONDS, "holdings_updated_at"):
+            return _holdings_from_row(row)
+    except Exception:  # noqa: BLE001 - 快照表未建/读取失败 → 回退 akshare
+        pass
+    hp = _fetch_holdings_akshare(code)
+    if hp and client is not None:
+        try:
+            upsert_fund_snapshot_metrics(
+                client,
+                {
+                    "fund_code": code,
+                    "bond_report_period": hp.get("report_period"),
+                    "bond_categories": [list(x) for x in hp.get("categories", [])],
+                    "bond_nav_pct": [list(x) for x in hp.get("nav_pct", [])],
+                    "bond_total_nav_pct": hp.get("total_nav_pct"),
+                    "bond_count": hp.get("count"),
+                    "bond_no_stock": hp.get("no_stock"),
+                    "bond_has_convertible": hp.get("has_convertible"),
+                    "holdings_updated_at": datetime.now(_BJ_TZ).isoformat(),
+                },
+            )
+        except Exception:  # noqa: BLE001 - 回写失败不影响展示
+            pass
+    return hp
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _bond_risk_comparison(url: str, key: str, codes: tuple[str, ...]) -> pd.DataFrame:
+    """债基对比表（缓存 30 分钟）。批量读快照行：新鲜则直接重建（冷缓存也秒开），
+    仅未命中/过期才走单只计算+回写。"""
+    overview = _all_funds_overview(url, key, tuple(codes))
     by_code = {str(r.fund_code): r for r in overview.itertuples(index=False)}
+    snapshot: dict[str, dict] = {}
+    try:
+        client = _client_for(url, key)
+        data = _fetch_all_rows(
+            client.table("fund_snapshot_metrics")
+            .select("*")
+            .in_("fund_code", [normalize_fund_code(c) for c in codes])
+        )
+        snapshot = {normalize_fund_code(str(r["fund_code"])): r for r in data}
+    except Exception:  # noqa: BLE001 - 快照表未建/读取失败 → 走单只
+        pass
     rows = []
     for code in codes:
         code = normalize_fund_code(code)
-        rm = _bond_risk_metrics(url, key, code)
-        hp = _bond_holdings_profile(code)
+        row = snapshot.get(code)
+        if row is not None and row.get("bond_metrics") and _row_fresh(row, _METRICS_TTL_SECONDS, "bond_metrics_updated_at"):
+            rm = {"max_dd_1y": None, "max_dd_all": None, "recover_1y": None, "recover_all": None, **row["bond_metrics"]}
+            hp = _holdings_from_row(row)
+        else:
+            rm = _bond_risk_metrics(url, key, code)
+            hp = _bond_holdings_profile(url, key, code)
         ov = by_code.get(code)
         r1y = rm.get("recover_1y") or {}
         rall = rm.get("recover_all") or {}
@@ -578,6 +764,12 @@ def get_bond_risk_comparison(codes: list[str]) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].where(pd.notna(df[col]), None)
     return df
+
+
+def get_bond_risk_comparison(codes: list[str]) -> pd.DataFrame:
+    """债基对比：近1年/全历史最大回撤 + 最长回撤修复天数 + 底层安全性（类别占比）。"""
+    url, key = _credentials()
+    return _bond_risk_comparison(url, key, tuple(normalize_fund_code(c) for c in codes))
 
 
 def _compute_period_returns_from(frame: pd.DataFrame, periods: list[str]) -> dict[str, float | None]:
@@ -711,15 +903,22 @@ def get_bond_futures_history(code: str, range_key: str = "近1年") -> dict:
 _MARKET_OPEN_START = time(9, 30)
 _MARKET_OPEN_END = time(15, 0)
 
+# 中国市场统一按 UTC+8 北京时间判定（中国无夏令时，固定偏移即可，避免依赖 tzdata；
+# 不依赖机器本地时区，避免部署在非 UTC+8 环境时误判交易时间）
+_BJ_TZ = timezone(timedelta(hours=8), "Asia/Shanghai")
+
 
 def _market_status(quotes: dict, now: datetime | None = None) -> dict:
     """根据 TF 分钟线最新数据时间与当前时刻判定交易状态。
+
+    时区：一律按 UTC+8 北京时间——now 取北京时间，分钟数据（naive 北京时间）
+    按 UTC+8 解释，带时区则转到北京时间。不依赖机器本地时区。
 
     :return: {data_time, is_open, close_in_seconds, status_text}
     - is_open=True：分钟数据为今天且当前处于 9:30~15:00 可操作窗口（close_in_seconds=距 15:00 秒数）
     - 否则返回 status_text 说明原因（非交易日/未开盘/已收盘/数据缺失），绝不模拟
     """
-    now = now or datetime.now()
+    now = now or datetime.now(_BJ_TZ)
     tf = quotes.get("tf", {})
     data_time = tf.get("data_time")
     result = {
@@ -735,6 +934,11 @@ def _market_status(quotes: dict, now: datetime | None = None) -> dict:
     except ValueError:
         result["status_text"] = "分钟数据时间无法解析，无法判断交易状态"
         return result
+    # 分钟数据为北京时间（naive）→ 按 UTC+8 解释；带时区则统一转到北京时间
+    if data_dt.tzinfo is None:
+        data_dt = data_dt.replace(tzinfo=_BJ_TZ)
+    else:
+        data_dt = data_dt.astimezone(_BJ_TZ)
     if data_dt.date() != now.date():
         result["status_text"] = f"分钟数据为最近交易日 {data_dt:%m-%d}（当前非交易时间）"
         return result
@@ -744,7 +948,7 @@ def _market_status(quotes: dict, now: datetime | None = None) -> dict:
     if now.time() > _MARKET_OPEN_END:
         result["status_text"] = "今日已收盘（基金申购 15:00 截止）"
         return result
-    close_dt = datetime.combine(now.date(), _MARKET_OPEN_END)
+    close_dt = datetime.combine(now.date(), _MARKET_OPEN_END, tzinfo=_BJ_TZ)
     seconds = int((close_dt - now).total_seconds())
     result.update(is_open=True, close_in_seconds=max(seconds, 0), status_text="交易时间")
     return result
@@ -828,13 +1032,50 @@ def get_bond_futures_signal(code: str) -> dict:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def _nav_history_batch(url: str, key: str, codes: tuple[str, ...], start: str | None, end: str | None) -> pd.DataFrame:
+    """批量拉取多只基金净值：.in(fund_code) 一次查询（总览合并用，替代逐只 8 次往返）。"""
+    if not codes:
+        return pd.DataFrame(columns=["fund_code", "nav_date", "unit_nav", "adjusted_nav", "daily_return"])
+    client = _client_for(url, key)
+    qb = (
+        client.table("fund_nav_history")
+        .select("fund_code, trade_date, unit_nav, adjusted_nav, daily_return")
+        .in_("fund_code", list(codes))
+        .order("trade_date")
+    )
+    if start:
+        qb = qb.gte("trade_date", start)
+    if end:
+        qb = qb.lte("trade_date", end)
+    data = _fetch_all_rows(qb)
+    if not data:
+        return pd.DataFrame(columns=["fund_code", "nav_date", "unit_nav", "adjusted_nav", "daily_return"])
+    df = pd.DataFrame(data)
+    df["fund_code"] = df["fund_code"].astype(str).apply(normalize_fund_code)
+    df["nav_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    df["unit_nav"] = pd.to_numeric(df["unit_nav"], errors="coerce")
+    if "adjusted_nav" in df.columns:
+        df["adjusted_nav"] = pd.to_numeric(df["adjusted_nav"], errors="coerce")
+    if "daily_return" in df.columns:
+        df["daily_return"] = pd.to_numeric(df["daily_return"], errors="coerce")
+    df = df.drop(columns=["trade_date"]).dropna(subset=["nav_date", "unit_nav"]).reset_index(drop=True)
+    return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def _all_funds_overview(url: str, key: str, codes: tuple[str, ...]) -> pd.DataFrame:
     profiles = _fund_profiles(url, key)
+    start = (date.today() - timedelta(days=400)).isoformat()
+    navs = _nav_history_batch(url, key, tuple(codes), start, None)
     rows = []
     for code in codes:
         code = normalize_fund_code(code)
         meta = _meta_from_catalog_and_profiles(code, profiles)
-        frame = _nav_history(url, key, code, (date.today() - timedelta(days=400)).isoformat(), None)
+        frame = (
+            navs[navs["fund_code"] == code].sort_values("nav_date").reset_index(drop=True)
+            if not navs.empty
+            else pd.DataFrame()
+        )
         latest = _compute_latest_from(frame)
         period = _compute_period_returns_from(frame, ["近1周", "近1月", "近3月"])
         rows.append(
@@ -922,13 +1163,14 @@ def _market_indexes(url: str, key: str) -> list[dict]:
     for code in codes:
         spec = registry.get(code)
         name = (spec.index_name if spec and spec.index_name else "") or fallback_names.get(code, code)
-        rows = _fetch_all_rows(
+        rows = (
             client.table("index_daily_history")
             .select("close,change_pct")
             .eq("index_code", code)
             .order("trade_date", desc=True)
             .limit(1)
-        )
+            .execute()
+        ).data or []
         if rows:
             row = rows[0]
             result.append(
@@ -1117,8 +1359,13 @@ def get_latest_sync_time() -> str:
 
 @st.cache_data(ttl=300)
 def _server_counts(url: str, key: str) -> tuple[int, int]:
-    """存储服务器（Supabase）真实数据行数与表数（缓存 5 分钟）。"""
-    client = _client_for(url, key)
+    """存储服务器（Supabase）数据行数与表数（**估算值**）。
+
+    用户允许近似：count="planned" 用 PostgreSQL 规划器估算，秒级返回，不保证精确，
+    页面标注「估算」。11 张表并行（网络往返并发），每线程独立 client 避免共享连接并发问题。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     main_tables = (
         "fund_nav_history",
         "fund_dividends",
@@ -1128,20 +1375,28 @@ def _server_counts(url: str, key: str) -> tuple[int, int]:
         "macro_rates_history",
         "fund_profiles",
         "fund_tracking_index",
+        "fund_snapshot_metrics",
         "index_master",
         "sync_job",
         "sync_watermark",
     )
+
+    def _count_table(table: str) -> int:
+        try:
+            client = create_supabase_client(SupabaseSettings(url=url, key=key))
+            resp = client.table(table).select("*", count="planned").limit(1).execute()
+            return int(resp.count or 0)
+        except Exception:  # noqa: BLE001 - 单表失败不阻塞整体
+            return 0
+
     db_rows = 0
     tables = 0
-    for table in main_tables:
-        try:
-            resp = client.table(table).select("*", count="exact").limit(1).execute()
-            count = int(resp.count or 0)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_count_table, t) for t in main_tables]
+        for future in as_completed(futures):
+            count = future.result()
             db_rows += count
             tables += 1 if count > 0 else 0
-        except Exception:  # noqa: BLE001 - 单表失败不阻塞整体
-            pass
     return db_rows, tables
 
 
@@ -1196,6 +1451,8 @@ def _invalidate_caches() -> None:
         _watermarks,
         _all_funds_overview,
         _market_indexes,
+        _funds_bond_comparison,
+        _bond_risk_comparison,
     ):
         try:
             func.clear()

@@ -38,6 +38,10 @@ def normalize_fund_code(code) -> str:
 def _fetch_all_rows(query_builder, *, page_size: int = 1000) -> list[dict]:
     """Fetch all rows from a Supabase query using range pagination.
 
+    ⚠️ 注意：内部用 range() 分页会覆盖查询上的 .limit(n) —— 若只需取前 N 行
+    （如「最新 1 条」），请直接 query.limit(n).execute()，不要套本函数，
+    否则会把整张表全量拉下来（曾导致市场指数条 15s+）。
+
     传输层错误（连接/超时/断连，httpx.RequestError）自动重试，避免瞬时网络抖动
     直接中断读取（如 UI 净值走势读取）；业务错误（4xx/5xx APIError）不重试。
     """
@@ -233,6 +237,24 @@ def fetch_nav_history(client: Client, fund_code: str, *, start_date: str | None 
         df["daily_return"] = pd.to_numeric(df["daily_return"], errors="coerce")
     df = df.drop(columns=["trade_date"])
     return df.dropna(subset=["nav_date", "unit_nav"]).reset_index(drop=True)
+
+
+def fetch_fund_snapshot_metrics(client: Client, fund_code: str) -> dict | None:
+    """读取单只基金快照指标（规模/持仓），无则 None。"""
+    data = _fetch_all_rows(
+        client.table("fund_snapshot_metrics")
+        .select("*")
+        .eq("fund_code", normalize_fund_code(fund_code))
+    )
+    return data[0] if data else None
+
+
+def upsert_fund_snapshot_metrics(client: Client, row: dict) -> None:
+    """Upsert 单只基金快照指标（on_conflict=fund_code）。"""
+    payload = dict(row)
+    payload["fund_code"] = normalize_fund_code(payload.get("fund_code", ""))
+    if payload["fund_code"]:
+        client.table("fund_snapshot_metrics").upsert(payload, on_conflict="fund_code").execute()
 
 
 def upsert_fund_dividends(client: Client, dividend_df: pd.DataFrame) -> int:
