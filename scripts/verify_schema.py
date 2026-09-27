@@ -214,6 +214,7 @@ EXPECTED: dict[str, dict] = {
             "category_name": ("text", False),
             "fund_code": ("text", False),
             "index_code": ("text", True),
+            "sort_order": ("integer", False),
             "created_at": ("timestamp with time zone", False),
         },
         "pk": ["category_name", "fund_code"],

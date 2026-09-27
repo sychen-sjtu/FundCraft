@@ -234,6 +234,7 @@ create table if not exists public.fund_category_member (
     category_name text        not null,
     fund_code     text        not null,
     index_code    text        null,                      -- 对应策略底层指数（可空）
+    sort_order    integer     not null default 100,      -- 类别内展示顺序（小的在前）
     created_at    timestamptz not null default now(),
     primary key (category_name, fund_code),
     foreign key (category_name) references public.fund_category (category_name) on delete cascade
@@ -267,6 +268,9 @@ alter table public.fund_snapshot_metrics
     add column if not exists bond_metrics jsonb;
 alter table public.fund_snapshot_metrics
     add column if not exists bond_metrics_updated_at timestamptz;
+-- 类别成员展示顺序（网页端「⭐ 基金配置」支持上下移动；老库补列后按 created_at 兜底排序）
+alter table public.fund_category_member
+    add column if not exists sort_order integer not null default 100;
 
 
 -- ----------------------------------------------------------------------------

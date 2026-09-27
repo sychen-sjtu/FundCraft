@@ -33,6 +33,8 @@ from src.storage.fund_config import (  # noqa: E402
     fetch_fund_config,
     fund_codes_from_categories,
     remove_member,
+    reorder_categories,
+    reorder_members,
     resolve_fund_categories,
     seed_from_toml,
     tracking_rows_from_categories,
@@ -61,6 +63,7 @@ class FakeQuery:
         self._client = client
         self._table = table
         self._filters: list[tuple[str, object]] = []
+        self._order: list[tuple[str, bool]] = []
         self._action = "select"
         self._payload: object = None
         self._on_conflict: str = ""
@@ -71,7 +74,8 @@ class FakeQuery:
         self._action = "select"
         return self
 
-    def order(self, _column: str, desc: bool = False) -> "FakeQuery":
+    def order(self, column: str, desc: bool = False) -> "FakeQuery":
+        self._order.append((column, desc))
         return self
 
     def range(self, start: int, end: int) -> "FakeQuery":
@@ -108,6 +112,9 @@ class FakeQuery:
             out = [dict(row) for row in rows]
             for column, value in self._filters:
                 out = [row for row in out if row.get(column) == value]
+            # 与 PostgREST 一致：多次 order 依次生效（先按第一个键排，再按第二个）
+            for column, desc in reversed(self._order):
+                out.sort(key=lambda row: (row.get(column) is None, row.get(column)), reverse=desc)
             if self._range is not None:
                 start, end = self._range
                 out = out[start : end + 1]
@@ -258,6 +265,35 @@ def run_offline_checks() -> bool:
     ok &= _check("指数移除生效", resolve_index_list(index_client, LIST_MARKET_INDEXES) == ["H30269"])
     seeded = seed_list(index_client, LIST_MARKET_INDEXES, ["000300", "H30269"])
     ok &= _check("指数 seed 只增不覆盖", seeded == {"added": 1, "skipped": 1}, seeded)
+
+    # 9) 顺序调整：类别排序 / 类别内基金排序（顺序即展示顺序）
+    order_client = FakeClient()
+    upsert_category(order_client, "A", "净值", sort_order=10)
+    upsert_category(order_client, "B", "净值", sort_order=20)
+    add_member(order_client, "B", "000001", "X1")
+    add_member(order_client, "B", "000002")
+    cats = categories_from_config(fetch_fund_config(order_client))
+    ok &= _check(
+        "初始顺序：类别 A,B / 类别内 000001,000002",
+        list(cats) == ["A", "B"] and cats["B"].fund_codes == ("000001", "000002"),
+        f"{list(cats)} {cats['B'].fund_codes}",
+    )
+    reorder_categories(order_client, ["B", "A"])
+    ok &= _check(
+        "类别重排生效",
+        list(categories_from_config(fetch_fund_config(order_client))) == ["B", "A"],
+    )
+    reorder_members(order_client, "B", ["000002", "000001"])
+    cats = categories_from_config(fetch_fund_config(order_client))
+    ok &= _check("类别内重排生效", cats["B"].fund_codes == ("000002", "000001"), cats["B"].fund_codes)
+    ok &= _check("重排后 index_code 未丢", cats["B"].index_codes.get("000001") == "X1")
+    add_member(order_client, "B", "000001", "X9")  # 已存在：应保持原位、只更新指数
+    cats = categories_from_config(fetch_fund_config(order_client))
+    ok &= _check(
+        "重复添加已存在的基金会保持原位",
+        cats["B"].fund_codes == ("000002", "000001") and cats["B"].index_codes.get("000001") == "X9",
+        f"{cats['B'].fund_codes} {cats['B'].index_codes}",
+    )
     return ok
 
 

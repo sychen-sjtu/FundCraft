@@ -1,8 +1,10 @@
-"""基金详情页：大净值头部 + 折线图行情 + 历史净值明细 + 分红。
+"""基金详情页：大净值头部 + 业绩走势与最大回撤（上下联动） + 历史净值明细 + 分红。
 
 设计原则：
-- 图表全部用折线图展示；「历史净值明细」是固定 1 个月的轻量表格，不随时间范围胶囊联动。
-- 净值走势 / 最大回撤 / 分红记录 默认折叠；「债基」面板不展示分红记录。
+- 「业绩走势 + 最大回撤」合成一张图：上下两个折线子图共享时间轴，便于对照回撤位置；
+- 「历史净值明细」是固定 1 个月的轻量表格，不随时间范围胶囊联动；
+- 模块顺序：评估 → 核心指标（固收+/债基）→ 走势与净值明细 → 加仓信号（债基）→ RSI（红利低波）；
+- 分红记录默认折叠，仅「净值 / 固收+」面板展示（债基、红利低波不展示）；
 - 「红利低波」类基金展示 RSI 动能看板。
   （策略指标可视化已下线；指数层因子仍由同步任务入库，RSI 看板的股息率利差线复用该表。）
 """
@@ -18,11 +20,8 @@ from src.ui.charts import (
     build_bond_futures_change_chart,
     build_bond_futures_curve_chart,
     build_bond_futures_intraday_chart,
-    build_cumulative_vs_benchmark_chart,
     build_dividend_history_chart,
-    build_drawdown_area_chart,
-    build_nav_area_chart,
-    build_performance_chart,
+    build_performance_drawdown_chart,
     build_rsi_dashboard_chart,
 )
 from src.ui.theme import COLOR_BENCHMARK, COLOR_FUND_HIGHLIGHT, PLOTLY_CONFIG, detail_head_html
@@ -172,17 +171,20 @@ def _render_legend_stats(items: list[dict]) -> None:
 
 
 def _render_performance_chart(code: str, nav_df: pd.DataFrame, range_key: str) -> None:
-    """业绩走势：复权净值累计收益率折线图，可下拉选择对比大盘指数（TOML 配置）。"""
+    """业绩走势 + 最大回撤：上下共享时间轴的双子图，可下拉选择对比大盘指数。
+
+    上图 = 复权净值累计收益率；下图 = 同一区间的最大回撤；两图联动缩放/悬停。
+    """
     options = _compare_index_options()
     codes = [opt["code"] for opt in options]
     names = {opt["code"]: opt["name"] for opt in options}
 
-    # 单行头部：业绩走势(小字) + “？”帮助气泡 + 对比指数下拉
+    # 单行头部：标题(小字) + “？”帮助气泡 + 对比指数下拉
     # 用横向容器：桌面同一行、窄屏（手机）自动换行，电脑/手机兼容
     with st.container(horizontal=True, key="perf_head"):
         st.markdown(
-            '<span style="font-size:13px;font-weight:700;color:#1F2329;">业绩走势'
-            '<span class="fc-help" data-tip="复权净值累计收益率：分红基金用复权净值（红利再投资口径），区间首日归一化为 0%，随时间范围胶囊联动。">?</span>'
+            '<span style="font-size:13px;font-weight:700;color:#1F2329;">业绩走势 · 最大回撤'
+            '<span class="fc-help" data-tip="上半图：复权净值累计收益率（分红基金用红利再投资口径），区间首日归一化为 0%；下半图：同一区间的最大回撤。两图共享时间轴，缩放与悬停联动，便于对照回撤发生在哪一段。随时间范围胶囊联动。">?</span>'
             '</span>',
             unsafe_allow_html=True,
         )
@@ -201,13 +203,13 @@ def _render_performance_chart(code: str, nav_df: pd.DataFrame, range_key: str) -
         bench = store.get_index_benchmark(selected, range_key=range_key)
         bench_name = names.get(selected, selected)
         bench_ret = _latest_cum_return(bench, col="benchmark") if not bench.empty else None
-        fig = build_cumulative_vs_benchmark_chart(nav_df, bench, benchmark_name=bench_name, show_legend=False)
+        fig = build_performance_drawdown_chart(nav_df, bench, benchmark_name=bench_name)
         items = [
             {"label": "本基金", "color": COLOR_FUND_HIGHLIGHT, "value": _fmt_pct(fund_ret), "cls": _pct_cls(fund_ret), "w": 20, "h": 3},
             {"label": bench_name, "color": COLOR_BENCHMARK, "value": _fmt_pct(bench_ret), "cls": _pct_cls(bench_ret), "w": 20, "h": 1},
         ]
     else:
-        fig = build_performance_chart(nav_df, show_legend=False)
+        fig = build_performance_drawdown_chart(nav_df)
         items = [
             {"label": "本基金", "color": COLOR_FUND_HIGHLIGHT, "value": _fmt_pct(fund_ret), "cls": _pct_cls(fund_ret), "w": 20, "h": 3},
         ]
@@ -781,10 +783,6 @@ def render() -> None:
     if meta["panel"] in ("固收+", "债基"):
         _render_bond_metrics(code, title=f"{meta['category']} 核心指标")
 
-    # ---------- 国债期货加仓信号（panel=债基 专用） ----------
-    if meta["panel"] == "债基":
-        _render_bond_futures_signal(code)
-
     # ---------- 时间范围胶囊（联动下方所有图表与指标） ----------
     range_key = st.segmented_control(
         "时间范围",
@@ -796,7 +794,7 @@ def render() -> None:
 
     nav_df = store.get_nav_history(code, range_key=range_key)
 
-    # ---------- 业绩走势（白底卡片：对比下拉框 + 图例统计条 + 折线图） ----------
+    # ---------- 业绩走势 + 最大回撤（白底卡片：对比下拉框 + 图例统计条 + 上下联动双子图） ----------
     with st.container(border=True, key="perf_panel"):
         _render_performance_chart(code, nav_df, range_key)
 
@@ -804,19 +802,15 @@ def render() -> None:
     with st.container(border=True, key="nav_panel"):
         _render_nav_table(code)
 
-    # ---------- 净值走势（默认折叠） ----------
-    with st.expander("📉 净值走势", expanded=False):
-        st.plotly_chart(build_nav_area_chart(nav_df), width="stretch", config=PLOTLY_CONFIG, key="nav_area")
-
-    # ---------- 最大回撤（默认折叠） ----------
-    with st.expander("📉 最大回撤", expanded=False):
-        st.plotly_chart(build_drawdown_area_chart(nav_df), width="stretch", config=PLOTLY_CONFIG, key="drawdown_area")
+    # ---------- 国债期货加仓信号（panel=债基 专用；放在走势/净值明细之后） ----------
+    if meta["panel"] == "债基":
+        _render_bond_futures_signal(code)
 
     # ---------- RSI 动能看板（红利低波） ----------
     if meta["panel"] == "红利低波":
         _render_rsi_dashboard(code)
 
-    # ---------- 分红记录（默认折叠，折线图；债基面板不展示） ----------
-    if meta["panel"] != "债基":
+    # ---------- 分红记录（默认折叠，折线图；债基与红利低波面板不展示） ----------
+    if meta["panel"] not in ("债基", "红利低波"):
         with st.expander("💰 分红记录", expanded=False):
             _render_dividends(code)

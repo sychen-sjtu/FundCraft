@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from src.config import DEFAULT_PANEL, FundCategory, load_fund_categories
 from src.storage.supabase_store import _fetch_all_rows, normalize_fund_code
@@ -33,9 +33,10 @@ PANEL_DESCRIPTIONS: dict[str, str] = {
     "红利低波": "基础面板 + RSI 动能看板",
 }
 
-# 建表脚本未执行时 PostgREST 返回的错误特征（表不存在 → 视为没有基金）
+# 建表脚本未执行时 PostgREST / Postgres 返回的错误特征（表不存在 → 视为没有基金）
+# 注意：不能把「column xxx does not exist」也算进来 —— 那是**表结构过期**（少了个列），
+# 需要原样报错让用户去跑 sql/schema.sql，而不是伪装成"没有基金"。
 _MISSING_TABLE_MARKERS = (
-    "does not exist",
     "could not find the table",
     "pgrst205",
     "42p01",
@@ -45,12 +46,15 @@ _DEFAULT_SORT_STEP = 10
 
 
 def is_missing_table_error(exc: BaseException) -> bool:
-    """判断异常是否为「目标表尚未创建」（而非网络/权限等真实故障）。
+    """判断异常是否为「目标表尚未创建」（而非网络/权限/表结构过期等真实故障）。
 
     供本模块与 src/storage/ui_index_config.py 共用（建表脚本未执行时的特征错误）。
     """
     text = str(exc).lower()
-    return any(marker in text for marker in _MISSING_TABLE_MARKERS)
+    if any(marker in text for marker in _MISSING_TABLE_MARKERS):
+        return True
+    # Postgres 原生写法：relation "public.xxx" does not exist
+    return "relation" in text and "does not exist" in text
 
 
 def fetch_fund_config(client: Any) -> dict:
@@ -65,7 +69,11 @@ def fetch_fund_config(client: Any) -> dict:
             client.table(CATEGORY_TABLE).select("category_name,panel,sort_order").order("sort_order")
         )
         members = _fetch_all_rows(
-            client.table(MEMBER_TABLE).select("category_name,fund_code,index_code,created_at").order("created_at")
+            # 类别内顺序：sort_order 优先；老库补列后同为 100 时按 created_at 兜底（保持原顺序）
+            client.table(MEMBER_TABLE)
+            .select("category_name,fund_code,index_code,sort_order,created_at")
+            .order("sort_order")
+            .order("created_at")
         )
     except Exception as exc:  # noqa: BLE001
         if is_missing_table_error(exc):
@@ -193,22 +201,52 @@ def delete_category(client: Any, category_name: str) -> None:
     client.table(CATEGORY_TABLE).delete().eq("category_name", str(category_name).strip()).execute()
 
 
+def _member_rows(client: Any, category_name: str) -> list[dict]:
+    """某类别现有成员行（含 sort_order）：用于「追加到末尾」和「保持原位」。"""
+    return _fetch_all_rows(
+        client.table(MEMBER_TABLE)
+        .select("fund_code,sort_order")
+        .eq("category_name", str(category_name).strip())
+    )
+
+
+def _append_sort_order(rows: Iterable[dict]) -> int:
+    """追加到末尾的顺序值：现有最大 sort_order + 步长。"""
+    orders = [int(row["sort_order"]) for row in rows if row.get("sort_order") is not None]
+    return (max(orders) if orders else 0) + _DEFAULT_SORT_STEP
+
+
 def add_member(
     client: Any,
     category_name: str,
     fund_code: str,
     index_code: str | None = None,
+    *,
+    sort_order: int | None = None,
 ) -> None:
-    """把一只基金加入类别（重复加入时更新 index_code）。"""
+    """把一只基金加入类别。
+
+    - 新成员：追加到类别末尾（sort_order = 现有最大值 + 步长）；
+    - 已存在的成员：**保持原位置**，只更新 index_code，
+      避免"只想改个指数，结果基金跳到列表末尾"。
+    """
     name = str(category_name).strip()
     code = normalize_fund_code(fund_code)
     if not name or not code:
         raise ValueError("类别名称与基金代码都不能为空。")
+    rows = _member_rows(client, name)
+    existing = {normalize_fund_code(row.get("fund_code")): row for row in rows}
+    if sort_order is None:
+        current = existing.get(code, {}).get("sort_order")
+        order = int(current) if current is not None else _append_sort_order(rows)
+    else:
+        order = int(sort_order)
     client.table(MEMBER_TABLE).upsert(
         {
             "category_name": name,
             "fund_code": code,
             "index_code": str(index_code or "").strip() or None,
+            "sort_order": order,
         },
         on_conflict="category_name,fund_code",
     ).execute()
@@ -230,6 +268,45 @@ def next_sort_order(client: Any) -> int:
     rows = _fetch_all_rows(client.table(CATEGORY_TABLE).select("sort_order"))
     existing = [int(row["sort_order"]) for row in rows if row.get("sort_order") is not None]
     return (max(existing) if existing else 0) + _DEFAULT_SORT_STEP
+
+
+def reorder_categories(client: Any, ordered_names: Iterable[str]) -> int:
+    """按给定顺序重写类别顺序（10/20/30…），供网页端「上移 / 下移」使用。
+
+    只写 category_name + sort_order 两列：PostgREST 的 upsert 只更新请求体里出现的列，
+    panel 等其它字段保持不动。
+    """
+    rows = [
+        {"category_name": str(name).strip(), "sort_order": (index + 1) * _DEFAULT_SORT_STEP}
+        for index, name in enumerate(ordered_names)
+        if str(name).strip()
+    ]
+    if rows:
+        client.table(CATEGORY_TABLE).upsert(rows, on_conflict="category_name").execute()
+    return len(rows)
+
+
+def reorder_members(client: Any, category_name: str, ordered_codes: Iterable[str]) -> int:
+    """按给定顺序重写某类别内基金顺序（10/20/30…），供「上移 / 下移」使用。
+
+    同样只写顺序相关的列，index_code 不会被清空。
+    """
+    name = str(category_name).strip()
+    rows = []
+    for index, code in enumerate(ordered_codes):
+        normalized = normalize_fund_code(code)
+        if not normalized:
+            continue
+        rows.append(
+            {
+                "category_name": name,
+                "fund_code": normalized,
+                "sort_order": (index + 1) * _DEFAULT_SORT_STEP,
+            }
+        )
+    if rows:
+        client.table(MEMBER_TABLE).upsert(rows, on_conflict="category_name,fund_code").execute()
+    return len(rows)
 
 
 def seed_from_toml(client: Any, project_root: Path | None = None) -> dict:
@@ -257,12 +334,18 @@ def seed_from_toml(client: Any, project_root: Path | None = None) -> dict:
             upsert_category(client, category.name, category.panel, sort_order=order)
             existing_names.add(category.name)
             added_categories += 1
-        for code in category.fund_codes:
+        for position, code in enumerate(category.fund_codes, start=1):
             key = (category.name, code)
             if key in existing_members:
                 skipped_members += 1
                 continue
-            add_member(client, category.name, code, category.index_codes.get(code))
+            add_member(
+                client,
+                category.name,
+                code,
+                category.index_codes.get(code),
+                sort_order=position * _DEFAULT_SORT_STEP,
+            )
             existing_members.add(key)
             added_members += 1
     return {

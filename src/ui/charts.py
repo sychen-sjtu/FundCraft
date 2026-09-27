@@ -18,197 +18,6 @@ def _hex_with_alpha(hex_color: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
-def _series_direction(nav_df: pd.DataFrame) -> int:
-    """区间整体方向：1 上涨 / -1 下跌 / 0 平（按首尾净值判断）。"""
-    if nav_df.empty or len(nav_df) < 2:
-        return 0
-    first = float(nav_df["unit_nav"].iloc[0])
-    last = float(nav_df["unit_nav"].iloc[-1])
-    if last > first:
-        return 1
-    if last < first:
-        return -1
-    return 0
-
-
-def build_nav_area_chart(nav_df: pd.DataFrame) -> go.Figure:
-    """单位净值面积图（支付宝风格）：区间上涨红色填充、下跌绿色填充。"""
-    from src.ui.theme import COLOR_DOWN, COLOR_UP
-
-    figure = go.Figure()
-    if nav_df.empty:
-        return figure
-
-    ordered = nav_df.sort_values("nav_date")
-    direction = _series_direction(ordered)
-    fill_color = COLOR_UP if direction >= 0 else COLOR_DOWN
-
-    figure.add_trace(
-        go.Scatter(
-            x=ordered["nav_date"],
-            y=ordered["unit_nav"],
-            mode="lines",
-            name="单位净值",
-            line=dict(color=fill_color, width=2.2),
-            fill="tozeroy",
-            fillcolor=_hex_with_alpha(fill_color, 0.10),
-            hovertemplate="%{x|%Y-%m-%d}<br>单位净值：%{y:.4f}<extra></extra>",
-        )
-    )
-    figure.update_layout(
-        template="plotly_white",
-        height=240,
-        margin=dict(l=10, r=10, t=30, b=10),
-        hovermode="x unified",
-        dragmode=False,
-        xaxis_title="",
-        yaxis_title="单位净值",
-    )
-    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3", tickformat="%Y-%m-%d")
-    figure.update_yaxes(showgrid=True, gridcolor="#F0F1F3")
-    return figure
-
-
-def build_cumulative_vs_benchmark_chart(
-    nav_df: pd.DataFrame,
-    benchmark_df: pd.DataFrame,
-    benchmark_name: str = "沪深300",
-    show_legend: bool = True,
-) -> go.Figure:
-    """累计收益率 vs 大盘指数对比（区间首日归一化为 0%）。
-
-    主基金高亮橙（COLOR_FUND_HIGHLIGHT），对比指数中性灰细虚线（COLOR_BENCHMARK），
-    去填充、轻网格，聚焦主线。
-
-    :param benchmark_name: 对比指数显示名（图例/hover，如 沪深300 / 上证指数 / 深证成指）。
-    :param show_legend: 是否显示 Plotly 图例（页面内用图例统计条代替时传 False）。
-    """
-    from src.ui.theme import COLOR_BENCHMARK, COLOR_FUND_HIGHLIGHT
-
-    figure = go.Figure()
-    if nav_df.empty:
-        return figure
-
-    ordered = nav_df.sort_values("nav_date")
-    # 分红基金必须用复权净值（与业绩走势、全收益基准 000300S 口径一致）；无复权时回退单位净值
-    col = "adjusted_nav" if "adjusted_nav" in ordered.columns and ordered["adjusted_nav"].notna().any() else "unit_nav"
-    base = float(ordered[col].iloc[0])
-    cum_return = (ordered[col] / base - 1.0) * 100.0
-
-    figure.add_trace(
-        go.Scatter(
-            x=ordered["nav_date"],
-            y=cum_return,
-            mode="lines",
-            name="本基金",
-            line=dict(color=COLOR_FUND_HIGHLIGHT, width=2.5),
-            hovertemplate="%{x|%Y-%m-%d}<br>累计收益：%{y:.2f}%<extra></extra>",
-        )
-    )
-
-    if not benchmark_df.empty:
-        bench = benchmark_df.sort_values("nav_date")
-        bench_base = float(bench["benchmark"].iloc[0])
-        bench_return = (bench["benchmark"] / bench_base - 1.0) * 100.0
-        figure.add_trace(
-            go.Scatter(
-                x=bench["nav_date"],
-                y=bench_return,
-                mode="lines",
-                name=benchmark_name,
-                # 对比线：极淡灰、细、实线（背景化，不抢主线）
-                line=dict(color=COLOR_BENCHMARK, width=1, dash=None),
-                hovertemplate=f"%{{x|%Y-%m-%d}}<br>{benchmark_name}：%{{y:.2f}}%<extra></extra>",
-            )
-        )
-
-    figure.update_layout(
-        template="plotly_white",
-        height=220,
-        margin=dict(l=4, r=4, t=16, b=10),
-        hovermode="x unified",
-        dragmode=False,
-        showlegend=show_legend,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-    )
-    # 左侧只显示数字刻度（密度适中 nticks=7）、0 轴基准线加深、横向网格极淡、隐藏纵向网格、左右边距最小化
-    figure.update_yaxes(
-        zeroline=True, zerolinecolor="#B0B0B0", zerolinewidth=1.2,
-        gridcolor="#F0F0F0", nticks=7,
-    )
-    figure.update_xaxes(showgrid=False, tickformat="%Y-%m-%d")
-    return figure
-
-
-def build_drawdown_area_chart(nav_df: pd.DataFrame) -> go.Figure:
-    """最大回撤面积图（恒为负值，绿色填充）。"""
-    from src.ui.theme import COLOR_DOWN
-
-    figure = go.Figure()
-    if nav_df.empty:
-        return figure
-
-    ordered = nav_df.sort_values("nav_date")
-    drawdown_df = build_drawdown_series(ordered)
-
-    figure.add_trace(
-        go.Scatter(
-            x=drawdown_df["nav_date"],
-            y=drawdown_df["drawdown_pct"],
-            mode="lines",
-            name="回撤 (%)",
-            line=dict(color=COLOR_DOWN, width=2),
-            fill="tozeroy",
-            fillcolor=_hex_with_alpha(COLOR_DOWN, 0.13),
-            hovertemplate="%{x|%Y-%m-%d}<br>回撤：%{y:.2f}%<extra></extra>",
-        )
-    )
-    figure.update_layout(
-        template="plotly_white",
-        height=180,
-        margin=dict(l=10, r=10, t=30, b=10),
-        hovermode="x unified",
-        dragmode=False,
-        yaxis_title="回撤 (%)",
-    )
-    figure.update_yaxes(zeroline=True, zerolinecolor="#D9D9D9", gridcolor="#F0F1F3")
-    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3", tickformat="%Y-%m-%d")
-    return figure
-
-
-def build_sparkline(nav_df: pd.DataFrame, height: int = 60) -> go.Figure:
-    """卡片右侧迷你走势图（无坐标轴、无网格）。"""
-    figure = go.Figure()
-    if nav_df.empty:
-        return figure
-
-    ordered = nav_df.sort_values("nav_date")
-    direction = _series_direction(ordered)
-    color = "#E64A3D" if direction >= 0 else "#00B578"
-
-    figure.add_trace(
-        go.Scatter(
-            x=ordered["nav_date"],
-            y=ordered["unit_nav"],
-            mode="lines",
-            line=dict(color=color, width=1.8),
-            fill="tozeroy",
-            fillcolor=_hex_with_alpha(color, 0.10),
-            hovertemplate="%{x|%Y-%m-%d}<br>净值：%{y:.4f}<extra></extra>",
-        )
-    )
-    figure.update_layout(
-        height=height,
-        margin=dict(l=0, r=0, t=0, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False),
-        hovermode="x unified",
-    )
-    return figure
-
-
 def build_dividend_history_chart(dividend_df: pd.DataFrame) -> go.Figure:
     """分红历史折线图：累计每份分红（元）随除息日变化。"""
     from src.ui.theme import COLOR_PRIMARY
@@ -242,50 +51,123 @@ def build_dividend_history_chart(dividend_df: pd.DataFrame) -> go.Figure:
     return figure
 
 
-def build_performance_chart(nav_df: pd.DataFrame, show_legend: bool = True) -> go.Figure:
-    """业绩走势折线图：复权净值累计收益率（%）时间序列，区间首日归一化为 0%。
+def build_performance_drawdown_chart(
+    nav_df: pd.DataFrame,
+    benchmark_df: pd.DataFrame | None = None,
+    benchmark_name: str = "沪深300",
+) -> go.Figure:
+    """业绩走势 + 最大回撤：上下两个折线子图共享时间轴。
 
-    分红基金（008163 每月分红）必须用复权净值，单位净值会严重低估收益；
-    x 轴为日期（YYYY-MM-DD），主基金线固定高亮橙（无论是否对比都一致）。
+    - 上图：本基金累计收益率（区间首日归一化为 0%），可选大盘指数对比线；
+    - 下图：最大回撤（面积图，恒为负值），用来对照"回撤发生在收益曲线的哪一段"；
+    - 两图共享 X 轴与悬停十字线：缩放/悬停一次即可上下对照。
+
+    口径：分红基金（如 008163 每月分红）用**复权净值**，否则会低估收益、并在除息日
+    制造假回撤；上下两图使用同一列，保证能对齐比较。
+
+    :param benchmark_df: 可选对比指数（列 nav_date / benchmark）；空则只画本基金。
+    :param benchmark_name: 对比指数显示名（悬停提示用）。
     """
-    from src.ui.theme import COLOR_FUND_HIGHLIGHT
+    from src.ui.theme import COLOR_BENCHMARK, COLOR_DOWN, COLOR_FUND_HIGHLIGHT
 
-    figure = go.Figure()
-    if nav_df.empty or "adjusted_nav" not in nav_df.columns:
+    figure = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        row_heights=[0.72, 0.28],
+    )
+    if nav_df.empty:
         return figure
 
     ordered = nav_df.sort_values("nav_date")
-    base = float(ordered["adjusted_nav"].iloc[0])
+    col = "adjusted_nav" if "adjusted_nav" in ordered.columns and ordered["adjusted_nav"].notna().any() else "unit_nav"
+    base = float(ordered[col].iloc[0])
     if not base:
         return figure
-    cum_return = (ordered["adjusted_nav"] / base - 1.0) * 100.0
+    cum_return = (ordered[col] / base - 1.0) * 100.0
 
+    # ---------------- 上图：累计收益率（本基金 + 可选对比指数） ----------------
     figure.add_trace(
         go.Scatter(
             x=ordered["nav_date"],
             y=cum_return,
             mode="lines",
-            name="业绩走势",
+            name="本基金",
             line=dict(color=COLOR_FUND_HIGHLIGHT, width=2.5),
             fill="tozeroy",
             fillcolor=_hex_with_alpha(COLOR_FUND_HIGHLIGHT, 0.04),
             hovertemplate="%{x|%Y-%m-%d}<br>累计收益：%{y:.2f}%<extra></extra>",
-        )
+        ),
+        row=1,
+        col=1,
     )
+
+    if benchmark_df is not None and not benchmark_df.empty:
+        bench = benchmark_df.sort_values("nav_date")
+        bench_base = float(bench["benchmark"].iloc[0])
+        if bench_base:
+            figure.add_trace(
+                go.Scatter(
+                    x=bench["nav_date"],
+                    y=(bench["benchmark"] / bench_base - 1.0) * 100.0,
+                    mode="lines",
+                    name=benchmark_name,
+                    # 对比线：极淡灰细线（背景化，不抢主线）
+                    line=dict(color=COLOR_BENCHMARK, width=1),
+                    hovertemplate=f"%{{x|%Y-%m-%d}}<br>{benchmark_name}：%{{y:.2f}}%<extra></extra>",
+                ),
+                row=1,
+                col=1,
+            )
+
+    # ---------------- 下图：最大回撤（与上图同口径） ----------------
+    drawdown_df = build_drawdown_series(ordered, nav_col=col)
+    figure.add_trace(
+        go.Scatter(
+            x=drawdown_df["nav_date"],
+            y=drawdown_df["drawdown_pct"],
+            mode="lines",
+            name="回撤 (%)",
+            line=dict(color=COLOR_DOWN, width=2),
+            fill="tozeroy",
+            fillcolor=_hex_with_alpha(COLOR_DOWN, 0.13),
+            hovertemplate="%{x|%Y-%m-%d}<br>回撤：%{y:.2f}%<extra></extra>",
+        ),
+        row=2,
+        col=1,
+    )
+
+    # ---------------- 布局：共享 X 轴，一次悬停同时看两图 ----------------
     figure.update_layout(
         template="plotly_white",
-        height=220,
+        height=430,
         margin=dict(l=4, r=4, t=16, b=10),
         hovermode="x unified",
         dragmode=False,
-        showlegend=show_legend,
+        showlegend=False,  # 页面上方用「图例统计条」代替 Plotly 图例
     )
-    # 左侧只显示数字刻度（密度适中 nticks=7）、0 轴基准线加深、横向网格极淡、隐藏纵向网格、左右边距最小化
+    # 上图：只显示数字刻度（密度适中）、0 轴基准线加深、横向网格极淡
     figure.update_yaxes(
-        zeroline=True, zerolinecolor="#B0B0B0", zerolinewidth=1.2,
-        gridcolor="#F0F0F0", nticks=7,
+        row=1,
+        col=1,
+        zeroline=True,
+        zerolinecolor="#B0B0B0",
+        zerolinewidth=1.2,
+        gridcolor="#F0F0F0",
+        nticks=7,
     )
-    figure.update_xaxes(showgrid=False, tickformat="%Y-%m-%d")
+    # 下图：回撤轴（恒为负），刻度少一些避免拥挤
+    figure.update_yaxes(
+        row=2,
+        col=1,
+        title_text="回撤 (%)",
+        zeroline=True,
+        zerolinecolor="#D9D9D9",
+        gridcolor="#F0F0F0",
+        nticks=4,
+    )
+    figure.update_xaxes(row=2, col=1, showgrid=True, gridcolor="#F0F0F0", tickformat="%Y-%m-%d")
     return figure
 
 

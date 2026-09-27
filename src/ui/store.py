@@ -39,6 +39,8 @@ from src.storage.fund_config import (
     fetch_fund_config,
     next_sort_order,
     remove_member,
+    reorder_categories,
+    reorder_members,
     upsert_category,
 )
 from src.storage.supabase_store import (
@@ -216,6 +218,49 @@ def remove_fund(category_name: str, fund_code: str) -> None:
     """把一只基金移出类别（= 取消关注）。"""
     url, key = _credentials()
     remove_member(_client_for(url, key), category_name, fund_code)
+    _invalidate_caches()
+
+
+def move_category(name: str, delta: int) -> None:
+    """类别整体上移/下移一位（delta = -1 上移 / +1 下移）；已在边界则不动。
+
+    顺序即总览页分组顺序与「基金配置」页的排列顺序。
+    """
+    url, key = _credentials()
+    client = _client_for(url, key)
+    names = [item["name"] for item in get_fund_config_snapshot()["categories"]]
+    if name not in names:
+        return
+    index = names.index(name)
+    target = index + delta
+    if target < 0 or target >= len(names):
+        return
+    names[index], names[target] = names[target], names[index]
+    reorder_categories(client, names)
+    _invalidate_caches()
+
+
+def move_fund(category_name: str, fund_code: str, delta: int) -> None:
+    """类别内某只基金上移/下移一位（delta = -1 上移 / +1 下移）；已在边界则不动。
+
+    顺序即总览页该类别下基金卡片的排列顺序。
+    """
+    url, key = _credentials()
+    client = _client_for(url, key)
+    snapshot = get_fund_config_snapshot()
+    category = next((item for item in snapshot["categories"] if item["name"] == category_name), None)
+    if category is None:
+        return
+    codes = [member["fund_code"] for member in category["members"]]
+    code = normalize_fund_code(fund_code)
+    if code not in codes:
+        return
+    index = codes.index(code)
+    target = index + delta
+    if target < 0 or target >= len(codes):
+        return
+    codes[index], codes[target] = codes[target], codes[index]
+    reorder_members(client, category_name, codes)
     _invalidate_caches()
 
 

@@ -57,17 +57,76 @@ def _render_new_category() -> None:
             st.rerun()
 
 
-def _render_category(name: str, panel: str, members: list[dict]) -> None:
-    """单个类别：成员列表（含移除）+ 添加基金表单 + 删除类别。"""
+def _move_category(name: str, delta: int) -> None:
+    """类别上移/下移一位（失败则提示）。"""
+    try:
+        store.move_category(name, delta)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"调整类别顺序失败：{exc}")
+        return
+    st.rerun()
+
+
+def _move_fund(category_name: str, code: str, delta: int) -> None:
+    """类别内基金上移/下移一位（失败则提示）。"""
+    try:
+        store.move_fund(category_name, code, delta)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"调整基金顺序失败：{exc}")
+        return
+    st.rerun()
+
+
+def _render_category(name: str, panel: str, members: list[dict], *, position: int, total: int) -> None:
+    """单个类别：类别排序 + 成员列表（排序/移除）+ 添加基金表单 + 删除类别。"""
     with st.expander(f"⭐ {name} · {len(members)} 只 · {panel} 面板", expanded=False):
+        # ---------- 类别整体排序（顺序即总览页分组顺序） ----------
+        col_up, col_down, col_hint = st.columns([1, 1, 5], vertical_alignment="center")
+        if col_up.button(
+            "▲ 上移",
+            key=f"category_up_{name}",
+            disabled=position == 0,
+            use_container_width=True,
+        ):
+            _move_category(name, -1)
+        if col_down.button(
+            "▼ 下移",
+            key=f"category_down_{name}",
+            disabled=position >= total - 1,
+            use_container_width=True,
+        ):
+            _move_category(name, 1)
+        col_hint.caption("调整类别顺序（总览页分组、本页排列都按此顺序）")
+
+        st.divider()
+
+        # ---------- 类别内基金（顺序即总览页卡片顺序） ----------
         if members:
-            for member in members:
+            for row_index, member in enumerate(members):
                 code = member["fund_code"]
                 index_code = member["index_code"]
-                col_code, col_index, col_action = st.columns([3, 4, 2], vertical_alignment="center")
+                col_code, col_index, col_up_m, col_down_m, col_remove = st.columns(
+                    [3, 3, 1, 1, 1], vertical_alignment="center"
+                )
                 col_code.markdown(f"**{code}**")
                 col_index.caption(f"策略指数：{index_code}" if index_code else "策略指数：未设置")
-                if col_action.button("🗑️ 移除", key=f"remove_{name}_{code}", use_container_width=True):
+                if col_up_m.button(
+                    "▲",
+                    key=f"fund_up_{name}_{code}",
+                    disabled=row_index == 0,
+                    use_container_width=True,
+                    help="上移",
+                ):
+                    _move_fund(name, code, -1)
+                if col_down_m.button(
+                    "▼",
+                    key=f"fund_down_{name}_{code}",
+                    disabled=row_index >= len(members) - 1,
+                    use_container_width=True,
+                    help="下移",
+                ):
+                    _move_fund(name, code, 1)
+                if col_remove.button("🗑️", key=f"remove_{name}_{code}", use_container_width=True, help="移除"):
                     try:
                         store.remove_fund(name, code)
                     except Exception as exc:  # noqa: BLE001
@@ -194,8 +253,15 @@ def render() -> None:
         st.info("还没有任何类别。展开上方「➕ 新建类别」建一个，再往里面添加基金代码。")
     else:
         st.divider()
-        for item in snapshot["categories"]:
-            _render_category(item["name"], item["panel"], item["members"])
+        total_categories = len(snapshot["categories"])
+        for position, item in enumerate(snapshot["categories"]):
+            _render_category(
+                item["name"],
+                item["panel"],
+                item["members"],
+                position=position,
+                total=total_categories,
+            )
         st.caption("提示：新增基金后，请到「🗄️ 数据管理」执行一次基金层刷新，净值与档案才会入库。")
 
     st.divider()
