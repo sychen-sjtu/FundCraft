@@ -1,10 +1,10 @@
 """📊 总览页：市场指数条 + 自选基金（按类别分组）卡片列表。
 
 对标支付宝理财首页：
-- 顶部市场指数条展示可配置的大盘指数简略信息（TOML [ui.market_indexes].codes）。
+- 顶部市场指数条展示大盘指数简略信息（展示哪些指数由服务器配置，见「⭐ 基金配置」页）。
 - 自选基金按类别分组展示；每只基金一张精简卡片（名称/代码/类别/区间收益，
   不显示净值与走势图），底部提供「查看详情」入口。
-- 概览指标（自选基金/净值更新/策略基金/最近同步）只保留一行简略说明，不占大版面。
+- 概览指标（自选基金/净值更新/红利低波/最近同步）只保留一行简略说明，不占大版面。
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from src.config import load_fund_categories
 from src.ui import store
 from src.ui.theme import fund_card_html, render_index_bar
 
@@ -137,7 +136,7 @@ def render() -> None:
     st.caption(
         f"自选基金 {metrics['fund_count']} 只 · "
         f"净值更新至 {metrics['latest_nav_date']} · "
-        f"策略基金 {metrics['strategy_fund_count']} 只 · "
+        f"红利低波 {metrics['strategy_fund_count']} 只 · "
         f"最近同步 {metrics['last_sync']}"
     )
 
@@ -149,13 +148,16 @@ def render() -> None:
         st.info("暂无自选基金。")
         return
 
-    # 类别顺序沿用 TOML 配置顺序；配置外的类别归入「其他」
-    ordered = [c.name for c in load_fund_categories(store.PROJECT_ROOT).values()]
+    # 类别顺序沿用配置顺序（即库表配置顺序）；配置外的类别归入「其他」
+    ordered = [c.name for c in store.get_fund_categories().values()]
     extra = sorted(c for c in overview["category"].dropna().unique() if c not in ordered)
     for category in ordered + extra:
         group = overview[overview["category"] == category]
         if group.empty:
             continue
+
+        # 面板类型决定该分组追加哪张对比表（面板来自配置，新增类别也能生效）
+        panel = str(group["panel"].iloc[0]) if "panel" in group.columns else ""
 
         st.subheader(f"⭐ {category}")
 
@@ -182,8 +184,8 @@ def render() -> None:
                         st.rerun()
 
         # 固收+ 核心指标对比表（默认加载）
-        if category == "固收+":
+        if panel == "固收+" or category == "固收+":
             _render_bond_comparison([str(r.fund_code) for r in group.itertuples(index=False)])
         # 债基 风控与持仓对比表（最大回撤/回撤修复天数/底层安全性类别占比）
-        if category == "债基":
+        if panel == "债基" or category == "债基":
             _render_bond_risk_comparison([str(r.fund_code) for r in group.itertuples(index=False)])

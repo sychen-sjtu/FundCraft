@@ -5,8 +5,8 @@
       之后总览页固收+/债基对比表即使冷缓存也直接读库，不再每次实时调 akshare
       或重拉全历史净值。
 
-前置：先在 Supabase SQL Editor 运行 sql/create_strategy_tables.sql
-      （含 2.5 建表 + 2.6 扩展 fund_metrics/bond_metrics 列）。
+前置：先在 Supabase SQL Editor 运行 sql/schema.sql（唯一建表脚本，
+      其中 4.5 建 fund_snapshot_metrics 表、第六节补 fund_metrics/bond_metrics 列）。
 
 用法：
   conda activate fundCraft

@@ -209,53 +209,6 @@ def build_sparkline(nav_df: pd.DataFrame, height: int = 60) -> go.Figure:
     return figure
 
 
-def build_strategy_scores_chart(factors_df: pd.DataFrame) -> go.Figure:
-    """策略 A/B 得分走势折线图（含触发线 80）。"""
-    from src.ui.theme import CHART_COLORS
-
-    figure = go.Figure()
-    if factors_df.empty:
-        return figure
-
-    ordered = factors_df.sort_values("trade_date")
-    figure.add_trace(
-        go.Scatter(
-            x=ordered["trade_date"],
-            y=ordered["score_a"],
-            name="A 得分",
-            line=dict(color=CHART_COLORS[0], width=2),
-            hovertemplate="%{x|%Y-%m-%d}<br>A 得分：%{y:.1f}<extra></extra>",
-        )
-    )
-    figure.add_trace(
-        go.Scatter(
-            x=ordered["trade_date"],
-            y=ordered["score_b"],
-            name="B 得分",
-            line=dict(color=CHART_COLORS[1], width=2),
-            hovertemplate="%{x|%Y-%m-%d}<br>B 得分：%{y:.1f}<extra></extra>",
-        )
-    )
-    figure.add_hline(
-        y=80,
-        line_dash="dash",
-        line_color="#8A8F99",
-        annotation_text="触发线 80",
-        annotation_position="top right",
-    )
-    figure.update_layout(
-        template="plotly_white",
-        height=220,
-        margin=dict(l=10, r=10, t=30, b=10),
-        hovermode="x unified",
-        dragmode=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-    )
-    figure.update_yaxes(title_text="得分", gridcolor="#F0F1F3")
-    figure.update_xaxes(showgrid=True, gridcolor="#F0F1F3", tickformat="%Y-%m-%d")
-    return figure
-
-
 def build_dividend_history_chart(dividend_df: pd.DataFrame) -> go.Figure:
     """分红历史折线图：累计每份分红（元）随除息日变化。"""
     from src.ui.theme import COLOR_PRIMARY

@@ -1,11 +1,11 @@
-"""校验 FundCraft 重建后的表结构（阶段 1：检查表是否正确）。
+"""校验 FundCraft 数据库结构（表是否存在 / 旧命名表是否残留）。
 
 用法（项目根目录，会提示输入解密口令，输入时不回显）：
     c:/Users/sychen/anaconda3/envs/fundCraft/python.exe scripts/verify_schema.py
 
-通过 information_schema 读取实表，与重建设计
-（docs/数据库重建-数据定义.md / sql/create_rebuild_tables.sql）逐表比对：
-  列（名称/类型/可空）、主键、外键；默认值仅作参考信息（格式化差异不算错）。
+比对基准：`sql/schema.sql`（唯一维护的建表脚本）+ `docs/数据库重建-数据定义.md`。
+本脚本只检查「表清单」这一层；字段 / 类型 / 主键 / 外键的逐列核对，请把
+`sql/schema.sql` 文末「【可选】只读校验查询」的结果贴回来，与下方 EXPECTED 对照。
 """
 
 from __future__ import annotations
@@ -73,7 +73,8 @@ EXPECTED: dict[str, dict] = {
             "created_at": ("timestamp with time zone", False),
         },
         "pk": ["fund_code", "index_code"],
-        "fk": {"fund_code": ("fund_profiles", "fund_code"), "index_code": ("index_master", "index_code")},
+        # 仅 index_code 建外键；fund_code 不建（配置先入库、档案后入库，建外键会冲突，见 sql/schema.sql）
+        "fk": {"index_code": ("index_master", "index_code")},
     },
     "index_master": {
         "columns": {
@@ -175,6 +176,60 @@ EXPECTED: dict[str, dict] = {
         "pk": ["log_id"],
         "fk": {},
     },
+    "fund_snapshot_metrics": {
+        "columns": {
+            "fund_code": ("text", False),
+            "fund_scale": ("numeric", True),
+            "scale_updated_at": ("timestamp with time zone", True),
+            "bond_report_period": ("text", True),
+            "bond_categories": ("jsonb", True),
+            "bond_nav_pct": ("jsonb", True),
+            "bond_total_nav_pct": ("numeric", True),
+            "bond_count": ("integer", True),
+            "bond_no_stock": ("boolean", True),
+            "bond_has_convertible": ("boolean", True),
+            "holdings_updated_at": ("timestamp with time zone", True),
+            "fund_metrics": ("jsonb", True),
+            "fund_metrics_updated_at": ("timestamp with time zone", True),
+            "bond_metrics": ("jsonb", True),
+            "bond_metrics_updated_at": ("timestamp with time zone", True),
+            "updated_at": ("timestamp with time zone", False),
+        },
+        "pk": ["fund_code"],
+        "fk": {},
+    },
+    "fund_category": {
+        "columns": {
+            "category_name": ("text", False),
+            "panel": ("text", False),
+            "sort_order": ("integer", False),
+            "created_at": ("timestamp with time zone", False),
+            "updated_at": ("timestamp with time zone", False),
+        },
+        "pk": ["category_name"],
+        "fk": {},
+    },
+    "fund_category_member": {
+        "columns": {
+            "category_name": ("text", False),
+            "fund_code": ("text", False),
+            "index_code": ("text", True),
+            "created_at": ("timestamp with time zone", False),
+        },
+        "pk": ["category_name", "fund_code"],
+        # index_code 不加外键（先加基金后登记指数的顺序会冲突，见 sql/schema.sql）
+        "fk": {"category_name": ("fund_category", "category_name")},
+    },
+    "ui_index_list": {
+        "columns": {
+            "list_key": ("text", False),
+            "index_code": ("text", False),
+            "sort_order": ("integer", False),
+            "created_at": ("timestamp with time zone", False),
+        },
+        "pk": ["list_key", "index_code"],
+        "fk": {},
+    },
 }
 
 
@@ -224,7 +279,7 @@ def main() -> None:
     if missing:
         print(f"  ❌ 缺少新表：{missing}")
     else:
-        print("  ✅ 11 张新表都存在（注意：存在不代表结构对，字段/主键/外键需再核对）")
+        print(f"  ✅ {len(NEW_TABLES)} 张表都存在（注意：存在不代表结构对，字段/主键/外键需再核对）")
     if leftovers:
         print(f"  ⚠️ 旧表残留：{leftovers}")
         print("     若旧表与新建表同名（如 fund_nav_history），会被 IF NOT EXISTS 跳过保持旧结构，")
@@ -232,7 +287,8 @@ def main() -> None:
     else:
         print("  ✅ 无旧命名表残留")
 
-    print("\n字段级核对：请在 Supabase SQL Editor 运行 sql/verify_schema_query.sql，把结果贴回来。")
+    print("\n字段级核对：请在 Supabase SQL Editor 运行 sql/schema.sql 文末的")
+    print("「【可选】只读校验查询」（单独选中执行），把结果贴回来对照 EXPECTED。")
 
 
 if __name__ == "__main__":

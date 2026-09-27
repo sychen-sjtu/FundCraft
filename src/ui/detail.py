@@ -1,10 +1,10 @@
-"""基金详情页：大净值头部 + 折线图行情 + 策略指标（默认不计算，按钮触发）+ 分红。
+"""基金详情页：大净值头部 + 折线图行情 + 历史净值明细 + 分红。
 
 设计原则：
-- 全部用折线图展示，不使用表格。
-- 「策略指标」（即策略因子）默认不计算，点击「计算策略指标」后展示当日指标 + 变化趋势折线图。
-- 净值走势 / 最大回撤 / 分红记录 默认折叠。
-- 「红利低波」类基金展示该基金自己的策略指标。
+- 图表全部用折线图展示；「历史净值明细」是固定 1 个月的轻量表格，不随时间范围胶囊联动。
+- 净值走势 / 最大回撤 / 分红记录 默认折叠；「债基」面板不展示分红记录。
+- 「红利低波」类基金展示 RSI 动能看板。
+  （策略指标可视化已下线；指数层因子仍由同步任务入库，RSI 看板的股息率利差线复用该表。）
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from src.ui.charts import (
     build_nav_area_chart,
     build_performance_chart,
     build_rsi_dashboard_chart,
-    build_strategy_scores_chart,
 )
 from src.ui.theme import COLOR_BENCHMARK, COLOR_FUND_HIGHLIGHT, PLOTLY_CONFIG, detail_head_html
 
@@ -216,9 +215,12 @@ def _render_performance_chart(code: str, nav_df: pd.DataFrame, range_key: str) -
     st.plotly_chart(fig, width="stretch", config=PLOTLY_CONFIG, key="perf_chart")
 
 
-def _render_nav_table(code: str, range_key: str) -> None:
-    """历史净值明细：轻量无边框表格（单位净值/累计净值/日涨跌幅，最新在前）。"""
-    nav = store.get_nav_history_with_cumulative(code, range_key=range_key)
+def _render_nav_table(code: str) -> None:
+    """历史净值明细：固定展示最近 1 个月（单位净值/累计净值/日涨跌幅，最新在前）。
+
+    不随时间范围胶囊联动 —— 更长的历史用上方「业绩走势」折线图看。
+    """
+    nav = store.get_nav_history_with_cumulative(code, range_key="近1月")
     if nav.empty:
         st.markdown(
             '<div class="fc-panel-head"><span class="fc-panel-title">历史净值明细</span>'
@@ -246,98 +248,13 @@ def _render_nav_table(code: str, range_key: str) -> None:
         )
     st.markdown(
         '<div class="fc-panel-head"><span class="fc-panel-title">历史净值明细</span>'
-        '<span class="fc-panel-note">最新在前</span></div>'
+        '<span class="fc-panel-note">近 1 个月 · 最新在前</span></div>'
         '<div class="fc-nav-table-wrap"><table class="fc-nav-table">'
         "<thead><tr><th>日期</th><th class='num'>单位净值</th><th class='num'>累计净值</th>"
         "<th class='num'>日涨跌幅</th></tr></thead>"
         f"<tbody>{''.join(rows_html)}</tbody></table></div>",
         unsafe_allow_html=True,
     )
-
-
-def _render_strategy_signal(code: str) -> None:
-    """策略指标：默认不计算，点按钮后计算并突出显示当日策略指标 + 变化趋势折线图。"""
-    st.divider()
-    st.subheader("🎯 策略指标")
-
-    computed_key = f"strategy_computed_{code}"
-    if not st.session_state.get(computed_key, False):
-        st.caption("策略指标（策略因子）默认不计算，计算较耗时。点击下方按钮开始计算，计算后展示当日策略指标与变化趋势。")
-        if st.button("🧮 计算策略指标", type="primary"):
-            st.session_state[computed_key] = True
-            st.rerun()
-        return
-
-    overview = store.get_strategy_overview(code)
-    if not overview:
-        st.info("暂无策略因子数据，请先在数据管理页执行刷新。")
-        return
-
-    st.markdown(
-        f'<span class="fc-today-tag">今日</span><b>当日策略指标</b>'
-        f'<span style="font-size:13px;color:#8A8F99;margin-left:8px;">信号日期：{pd.Timestamp(overview["trade_date"]).strftime("%Y-%m-%d")}</span>',
-        unsafe_allow_html=True,
-    )
-
-    signal_a = overview["signal_a"]
-    signal_b = overview["signal_b"]
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        badge_a = '<span class="fc-signal-buy">买入</span>' if signal_a else '<span class="fc-signal-wait">观望</span>'
-        st.markdown(
-            f'<div class="fc-metric-today"><div class="fc-metric-label">A 策略得分</div>'
-            f'<div class="fc-metric-value">{overview["score_a"]:.1f}</div>'
-            f'<div style="margin-top:6px;">{badge_a}</div></div>',
-            unsafe_allow_html=True,
-        )
-    with c2:
-        badge_b = '<span class="fc-signal-buy">买入</span>' if signal_b else '<span class="fc-signal-wait">观望</span>'
-        st.markdown(
-            f'<div class="fc-metric-today"><div class="fc-metric-label">B 策略得分</div>'
-            f'<div class="fc-metric-value">{overview["score_b"]:.1f}</div>'
-            f'<div style="margin-top:6px;">{badge_b}</div></div>',
-            unsafe_allow_html=True,
-        )
-    with c3:
-        st.markdown(
-            f'<div class="fc-metric-today"><div class="fc-metric-label">指数股息率</div>'
-            f'<div class="fc-metric-value">{overview["dividend_yield"]:.2f}%</div></div>',
-            unsafe_allow_html=True,
-        )
-    with c4:
-        st.markdown(
-            f'<div class="fc-metric-today"><div class="fc-metric-label">股息率-10Y 利差</div>'
-            f'<div class="fc-metric-value">{overview["spread"]:.2f}%</div></div>',
-            unsafe_allow_html=True,
-        )
-
-    # 策略指标变化趋势折线图（A/B 得分）
-    factors = store.get_strategy_factors(code, tail=180)
-    if not factors.empty:
-        st.markdown("**策略指标变化趋势（A/B 得分）**")
-        st.plotly_chart(build_strategy_scores_chart(factors), width="stretch", config=PLOTLY_CONFIG, key="strategy_scores")
-
-    # ---------- 策略回测占位（字段保留，功能未接入：真实回测引擎见 strategy_backtest.py） ----------
-    st.divider()
-    st.subheader("🧪 策略回测")
-    backtest_key = f"strategy_backtest_{code}"
-    if not st.session_state.get(backtest_key, False):
-        st.caption("策略回测功能暂未接入，字段先保留。")
-        if st.button("🧪 计算策略回测"):
-            st.session_state[backtest_key] = True
-            st.rerun()
-        return
-
-    bt = store.get_backtest_overview()
-    if bt:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("XIRR 年化", f'{bt["xirr_pct"]:.1f}%')
-        c2.metric("组合最大回撤", f'{bt["max_drawdown_pct"]:.1f}%')
-        c3.metric("信号触发", f'{bt["buy_count"]} 次')
-        c4.metric("回测区间", str(bt["period"]))
-    else:
-        st.info("暂无回测数据（回测功能待接入，不提供模拟数值）。")
 
 
 # RSI 看板信号类型 → 中文标签 / 颜色（与 charts._RSI_COLORS 一致）
@@ -883,9 +800,9 @@ def render() -> None:
     with st.container(border=True, key="perf_panel"):
         _render_performance_chart(code, nav_df, range_key)
 
-    # ---------- 历史净值明细表（白底卡片） ----------
+    # ---------- 历史净值明细表（白底卡片；固定近 1 个月，不随上方时间范围变化） ----------
     with st.container(border=True, key="nav_panel"):
-        _render_nav_table(code, range_key)
+        _render_nav_table(code)
 
     # ---------- 净值走势（默认折叠） ----------
     with st.expander("📉 净值走势", expanded=False):
@@ -895,11 +812,11 @@ def render() -> None:
     with st.expander("📉 最大回撤", expanded=False):
         st.plotly_chart(build_drawdown_area_chart(nav_df), width="stretch", config=PLOTLY_CONFIG, key="drawdown_area")
 
-    # ---------- RSI 动能看板 + 策略信号（红利低波） ----------
+    # ---------- RSI 动能看板（红利低波） ----------
     if meta["panel"] == "红利低波":
         _render_rsi_dashboard(code)
-        _render_strategy_signal(code)
 
-    # ---------- 分红记录（默认折叠，折线图） ----------
-    with st.expander("💰 分红记录", expanded=False):
-        _render_dividends(code)
+    # ---------- 分红记录（默认折叠，折线图；债基面板不展示） ----------
+    if meta["panel"] != "债基":
+        with st.expander("💰 分红记录", expanded=False):
+            _render_dividends(code)

@@ -24,19 +24,25 @@ import pandas as pd
 import streamlit as st
 
 from src.config import (
+    BOND_SIGNAL_PANELS,
+    FundCategory,
     SupabaseSettings,
-    load_bond_signal_fund_codes,
-    load_factor_fund_codes,
-    load_fund_categories,
-    load_fund_codes,
-    load_index_registry,
-    load_market_index_codes,
     load_supabase_settings,
     supabase_settings_ready,
 )
 from src.indicators.evaluation import evaluate_fund
 from src.indicators.fund_metrics import build_drawdown_series
+from src.storage.fund_config import (
+    add_member,
+    categories_from_config,
+    delete_category,
+    fetch_fund_config,
+    next_sort_order,
+    remove_member,
+    upsert_category,
+)
 from src.storage.supabase_store import (
+    _execute_with_retry,
     _fetch_all_rows,
     create_supabase_client,
     fetch_fund_dividends,
@@ -46,6 +52,12 @@ from src.storage.supabase_store import (
     list_fund_profiles,
     list_watermarks,
     upsert_fund_snapshot_metrics,
+)
+from src.storage.ui_index_config import (
+    LIST_MARKET_INDEXES,
+    add_index,
+    fetch_index_list,
+    remove_index,
 )
 
 
@@ -71,11 +83,18 @@ _PERIOD_DAYS = {"近1周": 7, "近1月": 30, "近3月": 90, "近6月": 180, "近
 # 业绩走势（复权净值）自然月区间：近 N 月 = 最新净值日往回 N 个自然月的同一天
 _PERIOD_MONTHS = {"近1月": 1, "近3月": 3, "近6月": 6, "近1年": 12, "近3年": 36}
 
+# 数据缓存有效期（秒）。业务数据只在「数据管理」页刷新时变化，而刷新会显式清理缓存
+# （见 _invalidate_caches），因此 TTL 取长值即可 —— 短 TTL 只会让每次重开页面都重新
+# 走一遍全部网络请求（实测冷启动 ~68s / 18 次请求，缓存命中 0s / 0 次）。
+# 若数据在别处（另一台机器 / 命令行）更新过，点「🗄️ 数据管理」页的
+# 「🔄 重新读取服务器数据」强制刷新即可。
+_CACHE_TTL = 12 * 3600
+
 
 # ---------- 基金目录（类别/面板来自配置；名称等从基金档案补齐） ----------
-def _build_catalog() -> dict[str, dict]:
+def _build_catalog(categories: dict[str, FundCategory]) -> dict[str, dict]:
     catalog: dict[str, dict] = {}
-    for category in load_fund_categories(PROJECT_ROOT).values():
+    for category in categories.values():
         for code in category.fund_codes:
             code = normalize_fund_code(code)
             catalog[code] = {
@@ -89,13 +108,115 @@ def _build_catalog() -> dict[str, dict]:
     return catalog
 
 
-_CATALOG = _build_catalog()
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
+def _fund_config(url: str, key: str) -> dict:
+    """库表配置（类别 + 成员）；配置表未建时 available=False。"""
+    return fetch_fund_config(_client_for(url, key))
 
 
-@lru_cache(maxsize=1)
+def get_fund_categories() -> dict[str, FundCategory]:
+    """当前生效的基金类别配置（库表是唯一来源）。
+
+    - 配置表可用 → 以库表为准（网页端增删即生效；删空就是没有基金）。
+    - 配置表未创建 / 数据库不可达 / 未连接 → 空配置。
+
+    不读任何文件配置：没有库表或连不上库，就是「没有基金」。
+    读取异常在此吞掉并返回空（表现为「暂无自选基金」，而不是整页报错）。
+    """
+    if not is_connected():
+        return {}
+    try:
+        url, key = _credentials()
+        raw = _fund_config(url, key)  # 走 5 分钟缓存，避免每次交互都多打一次数据库
+    except Exception:  # noqa: BLE001 - 网络/权限异常 → 视为没有基金
+        return {}
+    if not raw.get("available"):
+        return {}  # 配置表还没建 → 没有基金
+    return categories_from_config(raw)
+
+
+def get_fund_catalog() -> dict[str, dict]:
+    """基金目录（基金代码 → 类别/展示面板等元数据）。"""
+    return _build_catalog(get_fund_categories())
+
+
 def get_fund_codes() -> list[str]:
     """配置中的基金代码（规范化，去重）。"""
-    return list(_CATALOG.keys())
+    return list(get_fund_catalog().keys())
+
+
+# ---------- 基金配置管理（网页端增删「需要关注的基金」） ----------
+# 写操作一律落库（fund_category / fund_category_member），随后清理缓存使页面立即生效。
+# 建表脚本：sql/schema.sql（配置域两张表）；运行期库表是唯一来源，不读任何文件配置。
+# 一次性迁移（把 TOML 配置灌入库）走命令行：
+#     python scripts/check_fund_config.py --seed
+def _snapshot_items(
+    categories: dict[str, FundCategory],
+    members_by_category: dict[str, list[dict]],
+) -> list[dict]:
+    return [
+        {"name": name, "panel": category.panel, "members": members_by_category.get(name, [])}
+        for name, category in categories.items()
+    ]
+
+
+def get_fund_config_snapshot() -> dict:
+    """配置页数据：类别 / 成员明细 + 数据来源。
+
+    :return: ``{"source": "db"|"missing", "categories": [...]}``
+
+    - ``db``      ：配置表可用（库表是唯一来源；categories 为空 = 还没配置任何基金）
+    - ``missing`` ：配置表尚未创建（需先执行 sql/schema.sql）
+
+    数据库不可达时直接抛异常，由页面提示「读取失败」——此时无法管理基金。
+    """
+    url, key = _credentials()
+    raw = _fund_config(url, key)
+    if not raw.get("available"):
+        return {"source": "missing", "categories": []}
+
+    members_by_category: dict[str, list[dict]] = {}
+    for row in raw.get("members") or []:
+        name = str(row.get("category_name", "")).strip()
+        members_by_category.setdefault(name, []).append(
+            {
+                "fund_code": normalize_fund_code(row.get("fund_code", "")),
+                "index_code": str(row.get("index_code") or "").strip(),
+            }
+        )
+    return {
+        "source": "db",
+        "categories": _snapshot_items(categories_from_config(raw), members_by_category),
+    }
+
+
+def create_fund_category(name: str, panel: str) -> None:
+    """新建基金类别（sort_order 追加到现有类别之后）。"""
+    url, key = _credentials()
+    client = _client_for(url, key)
+    upsert_category(client, name, panel, sort_order=next_sort_order(client))
+    _invalidate_caches()
+
+
+def delete_fund_category(name: str) -> None:
+    """删除基金类别（成员随外键 cascade 删除）。"""
+    url, key = _credentials()
+    delete_category(_client_for(url, key), name)
+    _invalidate_caches()
+
+
+def add_fund(category_name: str, fund_code: str, index_code: str = "") -> None:
+    """把一只基金加入类别（= 加入关注列表）。"""
+    url, key = _credentials()
+    add_member(_client_for(url, key), category_name, fund_code, index_code)
+    _invalidate_caches()
+
+
+def remove_fund(category_name: str, fund_code: str) -> None:
+    """把一只基金移出类别（= 取消关注）。"""
+    url, key = _credentials()
+    remove_member(_client_for(url, key), category_name, fund_code)
+    _invalidate_caches()
 
 
 # ---------- 连接管理 ----------
@@ -145,7 +266,7 @@ def _range_bounds(range_key: str) -> tuple[str | None, str | None]:
     return start.isoformat(), None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _nav_history(url: str, key: str, code: str, start: str | None, end: str | None) -> pd.DataFrame:
     frame = fetch_nav_history(_client_for(url, key), code, start_date=start, end_date=end)
     if not frame.empty and "trade_date" in frame.columns:
@@ -153,19 +274,23 @@ def _nav_history(url: str, key: str, code: str, start: str | None, end: str | No
     return frame
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _fund_profiles(url: str, key: str) -> pd.DataFrame:
     return list_fund_profiles(_client_for(url, key))
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _dividends(url: str, key: str, code: str) -> pd.DataFrame:
     return fetch_fund_dividends(_client_for(url, key), code)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _strategy_factors(url: str, key: str, code: str) -> pd.DataFrame:
-    """某基金的策略因子 = 其跟踪指数的指数层因子（ER：信号在指数层）。"""
+    """某基金的策略因子 = 其跟踪指数的指数层因子（ER：信号在指数层）。
+
+    用途说明：「策略指标」可视化已下线，本表仍被 RSI 动能看板复用
+    （index_daily_factors.spread 用于股息率利差线），因此保留读取与入库链路。
+    """
     client = _client_for(url, key)
     mapping = _fetch_all_rows(
         client.table("fund_tracking_index").select("index_code,role").eq("fund_code", normalize_fund_code(code)).eq("role", "strategy")
@@ -189,9 +314,9 @@ def _strategy_factors(url: str, key: str, code: str) -> pd.DataFrame:
     return frame
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _sync_jobs(url: str, key: str) -> pd.DataFrame:
-    """最近同步任务日志（ttl=300；刷新后由 _invalidate_caches 主动清除，故可放宽）。"""
+    """最近同步任务日志（TTL=_CACHE_TTL；刷新后由 _invalidate_caches 主动清除）。"""
     response = (
         _client_for(url, key)
         .table("sync_job")
@@ -208,7 +333,7 @@ def _sync_jobs(url: str, key: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _watermarks(url: str, key: str) -> pd.DataFrame:
     return list_watermarks(_client_for(url, key))
 
@@ -265,7 +390,7 @@ def _attach_cumulative_nav(frame: pd.DataFrame, dividends: pd.DataFrame) -> pd.D
     return nav
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _nav_with_cumulative(url: str, key: str, code: str, start: str | None, end: str | None) -> pd.DataFrame:
     """净值明细（含累计净值列）：复用净值/分红缓存，内存推导累计净值。"""
     frame = _nav_history(url, key, code, start, end)
@@ -328,7 +453,7 @@ def _fetch_scale_akshare(code: str) -> float | None:
         return None
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _fund_scale(url: str, key: str, code: str) -> float | None:
     """基金最新规模（亿元）。优先读 Supabase fund_snapshot_metrics（24h 内新鲜），
     否则调 akshare 雪球并回写（低频变化，持久化后冷缓存也秒开）。"""
@@ -360,7 +485,7 @@ def get_fund_bond_metrics(code: str) -> dict:
     return _fund_bond_metrics(url, key, normalize_fund_code(code))
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _fund_bond_metrics(url: str, key: str, code: str) -> dict:
     """固收+ 核心指标：历史年化收益 / 最大回撤 / 卡玛比率 / 基金年限 / 基金规模（亿元）。
 
@@ -421,7 +546,7 @@ def _fund_bond_metrics(url: str, key: str, code: str) -> dict:
     return result
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _funds_bond_comparison(url: str, key: str, codes: tuple[str, ...]) -> pd.DataFrame:
     """固收+ 核心指标对比（缓存 30 分钟）。批量读快照行：新鲜则直接重建（冷缓存也秒开）。"""
     overview = _all_funds_overview(url, key, tuple(codes))
@@ -512,7 +637,7 @@ def _drawdown_recoveries(ordered: pd.DataFrame, col: str) -> list[dict]:
     return recoveries
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _bond_risk_metrics(url: str, key: str, code: str) -> dict:
     """债基风控指标：近1年/全历史最大回撤 + 最长已收复回撤段（交易日）。
 
@@ -662,7 +787,7 @@ def _holdings_from_row(row: dict) -> dict:
     }
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _bond_holdings_profile(url: str, key: str, code: str) -> dict:
     """债基底层安全性：优先读 Supabase fund_snapshot_metrics（7 天内新鲜），
     否则调 akshare 东财并回写（持仓季度更，持久化后冷缓存也秒开）。"""
@@ -697,7 +822,7 @@ def _bond_holdings_profile(url: str, key: str, code: str) -> dict:
     return hp
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _bond_risk_comparison(url: str, key: str, codes: tuple[str, ...]) -> pd.DataFrame:
     """债基对比表（缓存 30 分钟）。批量读快照行：新鲜则直接重建（冷缓存也秒开），
     仅未命中/过期才走单只计算+回写。"""
@@ -803,9 +928,15 @@ def _compute_period_returns_from(frame: pd.DataFrame, periods: list[str]) -> dic
     return result
 
 
-def _meta_from_catalog_and_profiles(code: str, profiles: pd.DataFrame) -> dict:
+def _meta_from_catalog_and_profiles(
+    code: str,
+    profiles: pd.DataFrame,
+    catalog: dict[str, dict] | None = None,
+) -> dict:
+    """目录（类别/面板）+ 基金档案（名称/类型/基准）合成展示元数据。"""
+    catalog = get_fund_catalog() if catalog is None else catalog
     meta = dict(
-        _CATALOG.get(
+        catalog.get(
             code,
             {
                 "fund_code": code,
@@ -849,10 +980,18 @@ _BOND_RANGE_DAYS = {"近1月": 30, "近3月": 90, "近6月": 180, "近1年": 365
 
 def get_bond_signal_codes() -> list[str]:
     """配置中需要显示「国债期货加仓信号」的基金（panel=债基）。"""
-    return [normalize_fund_code(code) for code in load_bond_signal_fund_codes(PROJECT_ROOT)]
+    codes: list[str] = []
+    for category in get_fund_categories().values():
+        if category.panel not in BOND_SIGNAL_PANELS:
+            continue
+        for code in category.fund_codes:
+            normalized = normalize_fund_code(code)
+            if normalized not in codes:
+                codes.append(normalized)
+    return codes
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _macro_rates(url: str, key: str, rate_code: str) -> pd.DataFrame:
     """落库宏观序列（cn_10y / bond_futures_tf / bond_futures_t），rate_date→trade_date。"""
     frame = fetch_macro_rates(_client_for(url, key), rate_code)
@@ -861,7 +1000,7 @@ def _macro_rates(url: str, key: str, rate_code: str) -> pd.DataFrame:
     return frame
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _bond_futures_history(url: str, key: str, code: str, start: str | None) -> dict:
     """国债期货加仓信号历史数据：TF/T 日线 + 历史买入点位（全历史算点位再按窗口裁剪）。"""
     from src.fetchers.bond_futures_fetcher import BOND_FUTURES
@@ -1031,7 +1170,7 @@ def get_bond_futures_signal(code: str) -> dict:
     }
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _nav_history_batch(url: str, key: str, codes: tuple[str, ...], start: str | None, end: str | None) -> pd.DataFrame:
     """批量拉取多只基金净值：.in(fund_code) 一次查询（总览合并用，替代逐只 8 次往返）。"""
     if not codes:
@@ -1062,15 +1201,18 @@ def _nav_history_batch(url: str, key: str, codes: tuple[str, ...], start: str | 
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _all_funds_overview(url: str, key: str, codes: tuple[str, ...]) -> pd.DataFrame:
     profiles = _fund_profiles(url, key)
-    start = (date.today() - timedelta(days=400)).isoformat()
+    catalog = get_fund_catalog()
+    # 首页只用 近1周/近1月/近3月（自然月回推最多 3 个月）→ 150 天足够且有缓冲。
+    # 原来取 400 天，会让每只基金多拉 2/3 的净值行，批量分页请求数也随之翻倍。
+    start = (date.today() - timedelta(days=150)).isoformat()
     navs = _nav_history_batch(url, key, tuple(codes), start, None)
     rows = []
     for code in codes:
         code = normalize_fund_code(code)
-        meta = _meta_from_catalog_and_profiles(code, profiles)
+        meta = _meta_from_catalog_and_profiles(code, profiles, catalog)
         frame = (
             navs[navs["fund_code"] == code].sort_values("nav_date").reset_index(drop=True)
             if not navs.empty
@@ -1083,6 +1225,7 @@ def _all_funds_overview(url: str, key: str, codes: tuple[str, ...]) -> pd.DataFr
                 "fund_code": code,
                 "fund_name": meta["fund_name"] or code,
                 "category": meta["category"],
+                "panel": meta["panel"],
                 "fund_type": meta["fund_type"],
                 "latest_nav": latest["unit_nav"],
                 "nav_date": latest["nav_date"],
@@ -1117,14 +1260,15 @@ def get_all_funds_overview() -> pd.DataFrame:
 def get_overview_metrics() -> dict:
     """总览页顶部指标（目录/状态信息，不含持仓口径）。"""
     url, key = _credentials()
-    codes = tuple(get_fund_codes())
+    catalog = get_fund_catalog()
+    codes = tuple(catalog.keys())
     overview = _all_funds_overview(url, key, codes)
     latest_date = None
     if not overview.empty:
         dates = pd.to_datetime(overview["nav_date"], errors="coerce").dropna()
         if not dates.empty:
             latest_date = dates.max().strftime("%Y-%m-%d")
-    strategy_count = sum(1 for code in codes if _CATALOG.get(code, {}).get("panel") == "红利低波")
+    strategy_count = sum(1 for code in codes if catalog.get(code, {}).get("panel") == "红利低波")
     jobs = _sync_jobs(url, key)
     last_sync = jobs["executed_at"].max().strftime("%Y-%m-%d %H:%M:%S") if not jobs.empty else "暂无"
     return {
@@ -1135,6 +1279,15 @@ def get_overview_metrics() -> dict:
     }
 
 
+# 指数名称兜底（库表 index_master 无名称时用；再没有就用代码本身）
+_FALLBACK_INDEX_NAMES = {
+    "000001": "上证指数",
+    "000300": "沪深300",
+    "399001": "深证成指",
+    "399006": "创业板指",
+}
+
+
 def get_market_indexes() -> list[dict]:
     """市场指数条（真实数据：index_daily_history 最新收盘/涨跌幅）。"""
     if not is_connected():
@@ -1143,36 +1296,108 @@ def get_market_indexes() -> list[dict]:
     return _market_indexes(url, key)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _market_indexes(url: str, key: str) -> list[dict]:
-    """市场指数条：展示 TOML [ui.market_indexes].codes 配置的指数最新行情。
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
+def _index_list(url: str, key: str, list_key: str) -> dict:
+    """界面指数列表（库表唯一来源）；配置表未建时 available=False。"""
+    return fetch_index_list(_client_for(url, key), list_key)
 
-    名称优先取 [indexes.registry] 注册名；无行情数据时返回 None（界面显示「暂无」），
-    绝不模拟数值。
+
+def get_market_index_codes() -> list[str]:
+    """市场指数条展示的指数代码（服务器配置，顺序即展示顺序）。
+
+    配置表未建 / 数据库不可达 / 未连接 → 空列表（不回退文件配置）。
+    """
+    if not is_connected():
+        return []
+    try:
+        url, key = _credentials()
+        return _index_list(url, key, LIST_MARKET_INDEXES)["codes"]
+    except Exception:  # noqa: BLE001 - 网络/权限异常 → 视为未配置
+        return []
+
+
+# ---------- 市场指数条配置（网页端增删，与基金配置同一套路） ----------
+def get_market_index_snapshot() -> dict:
+    """配置页用：指数条配置 + 每个指数当前是否有行情。
+
+    :return: ``{"available": bool, "items": [{"code","name","value"}]}``；
+             ``available=False`` 表示配置表尚未创建。
+    """
+    url, key = _credentials()
+    data = _index_list(url, key, LIST_MARKET_INDEXES)
+    if not data["available"]:
+        return {"available": False, "items": []}
+    quotes = {item["code"]: item for item in _market_indexes(url, key)}
+    items = [
+        {
+            "code": code,
+            "name": quotes.get(code, {}).get("name") or code,
+            "value": quotes.get(code, {}).get("value"),
+        }
+        for code in data["codes"]
+    ]
+    return {"available": True, "items": items}
+
+
+def add_market_index(index_code: str) -> None:
+    """把指数加入市场指数条（追加到末尾）。"""
+    url, key = _credentials()
+    add_index(_client_for(url, key), LIST_MARKET_INDEXES, index_code)
+    _invalidate_caches()
+
+
+def remove_market_index(index_code: str) -> None:
+    """把指数移出市场指数条。"""
+    url, key = _credentials()
+    remove_index(_client_for(url, key), LIST_MARKET_INDEXES, index_code)
+    _invalidate_caches()
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
+def _market_indexes(url: str, key: str) -> list[dict]:
+    """市场指数条：服务器配置的指数（ui_index_list）最新行情。
+
+    实现要点：
+    - **一次批量查询**取回所有展示指数最近若干行，再在内存里取每个指数最新一条
+      （原来每个指数一次查询，4 个指数就是 4 次往返）；
+    - 该查询走 _execute_with_retry，网络抖动会自动重试（此前这条路径没有重试）；
+    - 名称优先取库表 index_master.index_name（同步任务按 [indexes.registry] 写入），
+      其次内置兜底名，最后回落为代码本身；
+    - 拿不到行情时 value=None（界面显示「暂无」），绝不模拟数值。
     """
     client = _client_for(url, key)
-    registry = load_index_registry(PROJECT_ROOT)
-    codes = load_market_index_codes(PROJECT_ROOT)
-    fallback_names = {
-        "000001": "上证指数",
-        "000300": "沪深300",
-        "399001": "深证成指",
-        "399006": "创业板指",
-    }
-    result = []
+    codes = get_market_index_codes()
+    if not codes:
+        return []
+
+    names: dict[str, str] = {}
+    try:
+        for row in _fetch_all_rows(client.table("index_master").select("index_code,index_name")):
+            code = str(row.get("index_code") or "").strip().upper()
+            name = str(row.get("index_name") or "").strip()
+            if code and name:
+                names[code] = name
+    except Exception:  # noqa: BLE001 - 名称取不到不影响行情展示
+        names = {}
+
+    response = _execute_with_retry(
+        client.table("index_daily_history")
+        .select("index_code,trade_date,close,change_pct")
+        .in_("index_code", list(codes))
+        .order("trade_date", desc=True)
+        .limit(max(20 * len(codes), 40))
+    )
+    latest: dict[str, dict] = {}
+    for row in response.data or []:
+        code = str(row.get("index_code") or "").strip().upper()
+        if code not in latest:
+            latest[code] = row
+
+    result: list[dict] = []
     for code in codes:
-        spec = registry.get(code)
-        name = (spec.index_name if spec and spec.index_name else "") or fallback_names.get(code, code)
-        rows = (
-            client.table("index_daily_history")
-            .select("close,change_pct")
-            .eq("index_code", code)
-            .order("trade_date", desc=True)
-            .limit(1)
-            .execute()
-        ).data or []
-        if rows:
-            row = rows[0]
+        name = names.get(code) or _FALLBACK_INDEX_NAMES.get(code, code)
+        row = latest.get(code)
+        if row:
             result.append(
                 {
                     "code": code,
@@ -1187,7 +1412,7 @@ def _market_indexes(url: str, key: str) -> list[dict]:
 
 
 @lru_cache(maxsize=16)
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _benchmark_frame(url: str, key: str, index_code: str = "000300S") -> pd.DataFrame:
     """指定大盘指数（默认沪深300全收益 000300S）真实走势，用于归一化对比。"""
     client = _client_for(url, key)
@@ -1231,42 +1456,13 @@ def get_dividends(code: str) -> pd.DataFrame:
     return _dividends(url, key, normalize_fund_code(code))
 
 
-def get_strategy_factors(code: str, tail: int | None = None) -> pd.DataFrame:
-    """某只基金最近 N 条策略因子（按交易日期降序返回最近在前）。"""
-    url, key = _credentials()
-    frame = _strategy_factors(url, key, normalize_fund_code(code))
-    if frame.empty:
-        return frame
-    frame = frame.sort_values("trade_date", ascending=False).reset_index(drop=True)
-    if tail is not None:
-        frame = frame.head(tail)
-    return frame
-
-
-def get_strategy_overview(code: str) -> dict:
-    """某只基金最新策略信号概览。"""
-    frame = get_strategy_factors(code, tail=1)
-    if frame.empty:
-        return {}
-    row = frame.iloc[0]
-    return {
-        "trade_date": row["trade_date"],
-        "score_a": float(row["score_a"]),
-        "signal_a": bool(row["signal_a"]),
-        "score_b": float(row["score_b"]),
-        "signal_b": bool(row["signal_b"]),
-        "dividend_yield": float(row["dividend_yield"]),
-        "spread": float(row["spread"]),
-    }
-
-
 # ---------- RSI 动能看板（派生计算，不落库） ----------
 # 看板时间范围（周 RSI 需要较长历史，默认近 3 年，符合用户「近 3~5 年」建议）
 RSI_RANGE_OPTIONS = ["近1年", "近3年", "近5年", "全部"]
 RSI_RANGE_DAYS = {"近1年": 365, "近3年": 365 * 3, "近5年": 365 * 5}
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _rsi_dashboard_full(url: str, key: str, code: str) -> dict:
     """某基金的 RSI 看板数据（缓存）：基于【全历史】净值计算全部指标。
 
@@ -1305,7 +1501,7 @@ def get_rsi_dashboard(code: str, range_key: str = "近3年") -> dict:
     return slice_rsi_dashboard(data, pd.Timestamp(start))
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def _fund_evaluation(url: str, key: str, code: str) -> dict:
     """带 client 的评估（缓存 5 分钟；client 来自可哈希的 url/key）。"""
     return evaluate_fund(code, client=_client_for(url, key))
@@ -1325,15 +1521,6 @@ def get_fund_evaluation(code: str) -> dict:
         except Exception:  # noqa: BLE001 - 连接异常 → 回退无 client 评估
             pass
     return evaluate_fund(code)
-
-
-def get_backtest_overview() -> dict | None:
-    """回测概览占位。
-
-    字段保留但功能未接入：真实回测引擎见 src/indicators/strategy_backtest.py，
-    接入前返回 None（界面显示「暂无回测数据」）。
-    """
-    return None
 
 
 def get_sync_jobs() -> pd.DataFrame:
@@ -1357,7 +1544,7 @@ def get_latest_sync_time() -> str:
     return jobs["executed_at"].max().strftime("%Y-%m-%d %H:%M:%S")
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=_CACHE_TTL)
 def _server_counts(url: str, key: str) -> tuple[int, int]:
     """存储服务器（Supabase）数据行数与表数（**估算值**）。
 
@@ -1442,6 +1629,8 @@ def _clear_watermarks(client) -> None:
 def _invalidate_caches() -> None:
     """刷新后清理相关缓存，立即展示新数据。"""
     for func in (
+        _fund_config,
+        _index_list,
         _nav_history,
         _nav_with_cumulative,
         _fund_profiles,
@@ -1458,6 +1647,15 @@ def _invalidate_caches() -> None:
             func.clear()
         except Exception:  # noqa: BLE001
             pass
+
+
+def clear_read_caches() -> None:
+    """清空读取缓存：下次渲染重新读服务器。
+
+    用途：数据在别处（另一台机器 / 命令行同步）更新过时，强制本会话重新拉取。
+    对应界面按钮在「🗄️ 数据管理」页。
+    """
+    _invalidate_caches()
 
 
 def run_refresh(full: bool = False, progress_callback=None) -> tuple[list[dict], str | None]:

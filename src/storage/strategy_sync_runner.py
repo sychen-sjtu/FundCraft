@@ -1,9 +1,12 @@
-"""数据同步编排：配置(TOML→表) + 基金/利率/指数/因子 各层刷新 + 完整刷新。
+"""数据同步编排：配置(库表 → 表) + 基金/利率/指数/因子 各层刷新 + 完整刷新。
 
 新 ER 结构（UI 与 CLI 共用同一套逻辑）：
 - refresh_all：全量刷新（配置 → 基金 → cn_10y → 指数行情 → 指数估值 → 策略因子）
 - refresh_layer：按层刷新（fund / index / rate / factors），写 sync_watermark + sync_job
-- sync_config：TOML → index_master / fund_tracking_index
+- sync_config：配置 → index_master / fund_tracking_index
+
+关注列表（要拉哪些基金）来源：``fund_category`` / ``fund_category_member``（网页端可增删）。
+库表为空或未建表即「没有基金」，不回退文件配置；见 src/storage/fund_config.py。
 
 触发方式：
 - UI 数据管理页「增量/强制全量刷新」（refresh_all）与「按层刷新」（refresh_layer）
@@ -20,8 +23,6 @@ import pandas as pd
 
 from src.config import (
     IndexSpec,
-    load_fund_codes,
-    load_fund_tracking_index,
     load_index_registry,
     load_supabase_settings,
     supabase_settings_ready,
@@ -34,6 +35,11 @@ from src.fetchers.akshare_fund_nav import (
 from src.fetchers.fund_dividend_fetcher import fetch_fund_dividends as fetch_fund_dividends_ak
 from src.fetchers.index_valuation_fetcher import derive_index_dividend_yield
 from src.fetchers.macro_fetcher import fetch_cn_10y_rate
+from src.storage.fund_config import (
+    fund_codes_from_categories,
+    resolve_fund_categories,
+    tracking_rows_from_categories,
+)
 from src.storage.supabase_store import (
     create_supabase_client,
     delete_stale_fund_tracking_index,
@@ -80,16 +86,18 @@ class SyncProgress:
 
 
 def sync_config(client) -> dict:
-    """从 TOML 配置同步「指数注册表 + 基金→指数映射」到库。
+    """同步「指数注册表 + 基金→指数映射」到库。
 
-    配置源（唯一，调整后重跑同步即生效，不在 SQL/代码中硬编码）：
+    配置源（调整后重跑同步即生效，不在 SQL/代码中硬编码）：
     - 指数注册表  → .streamlit/secrets.toml 的 [indexes.registry]
-    - 基金→指数   → [funds.categories.*].index_codes（role='strategy'）
+    - 基金→指数   → 库表 fund_category_member.index_code（role='strategy'）；
+                    库表为空 / 未建表时回退 [funds.categories.*].index_codes
     兜底：被基金映射引用但未登记的指数自动补登记到 index_master（避免外键失败）。
-    对账：删除配置中已移除的映射/指数（调整 TOML 后重跑即生效，含删除）。
+    对账：删除配置中已移除的映射/指数（网页端删掉基金后重跑即生效，含删除）。
     """
     registry = load_index_registry()
-    tracking = load_fund_tracking_index()
+    categories, _source = resolve_fund_categories(client)
+    tracking = tracking_rows_from_categories(categories)
 
     specs: dict[str, IndexSpec] = dict(registry)
     tracking_codes: set[str] = set()
@@ -270,7 +278,12 @@ def _refresh_rate(client, progress: SyncProgress | None = None) -> list[dict]:
 def _refresh_indexes(client, registry, progress: SyncProgress | None = None) -> list[dict]:
     """指数层-行情：价格/全收益日行情 + 水位（000300S 用 H00300 拉取）。
 
-    增量：从「该指数水位 - OVERLAP_DAYS」起拉，空则全量。
+    增量：从「该指数水位 - OVERLAP_DAYS」起拉，无水位则全量。
+    ⚠️ 日期必须是紧凑格式 YYYYMMDD —— 中证接口不接受 ISO（2026-02-02 会让 akshare 抛错，
+    表现为只写入一条旧记录）；fetch_index_daily_history 内部也会再归一一次。
+
+    看门狗：抓到的最新日期若**早于**现有水位，说明没有真正推进（历史事故：日期格式错误导致
+    5 个中证指数静默停更六周），记为 error 并保持水位不动，让同步状态显示 partial。
     """
     from src.fetchers.index_valuation_fetcher import fetch_index_daily_history
     from src.storage.supabase_store import upsert_index_daily_history
@@ -283,13 +296,39 @@ def _refresh_indexes(client, registry, progress: SyncProgress | None = None) -> 
             progress.step(f"指数 {index_code}：日行情")
         try:
             since = _since_date(wm, ("index", index_code))
-            df = fetch_index_daily_history(symbol_map.get(index_code, index_code), start_date=since or "20000101")
-            if not df.empty:
-                df["index_code"] = index_code
-                n = upsert_index_daily_history(client, df)
-                if "trade_date" in df.columns:
-                    upsert_watermark(client, "index", index_code, df["trade_date"].max(), source="stock_zh_index_value_csindex")
-                results.append({"entity": "index", "index_code": index_code, "daily_rows": n})
+            start_date = (since or "20000101").replace("-", "")
+            df = fetch_index_daily_history(symbol_map.get(index_code, index_code), start_date=start_date)
+            if df.empty:
+                # 空结果原样跳过会让「什么都没抓到」看起来像成功（同类静默故障），显式记为错误
+                results.append(
+                    {
+                        "entity": "index",
+                        "index_code": index_code,
+                        "daily_rows": 0,
+                        "error": f"抓取返回空（增量起点 {start_date}）：未获得任何行情，请检查起点与数据源",
+                    }
+                )
+                continue
+            df["index_code"] = index_code
+            latest = pd.Timestamp(df["trade_date"].max())
+            previous = wm.get(("index", index_code))
+            # 先判断再写库：数据倒退时**不写入**，避免旧记录覆盖库里已有的新数据
+            if previous is not None and latest < pd.Timestamp(previous):
+                results.append(
+                    {
+                        "entity": "index",
+                        "index_code": index_code,
+                        "daily_rows": 0,
+                        "error": (
+                            f"行情未推进：抓到的最新日期 {latest.date()} 早于水位 "
+                            f"{pd.Timestamp(previous).date()}（疑似抓取参数或数据源异常），本次未写库"
+                        ),
+                    }
+                )
+                continue
+            n = upsert_index_daily_history(client, df)
+            upsert_watermark(client, "index", index_code, latest, source="stock_zh_index_value_csindex")
+            results.append({"entity": "index", "index_code": index_code, "daily_rows": n})
         except Exception as exc:  # noqa: BLE001
             results.append({"entity": "index", "index_code": index_code, "error": str(exc)})
     return results
@@ -399,7 +438,8 @@ def refresh_all(client, progress: SyncProgress | None = None) -> list[dict]:
     :param progress: 可选进度对象（SyncProgress 或 None）；CLI/无 UI 调用时传 None 即静默。
     """
     results: list[dict] = []
-    fund_codes = [normalize_fund_code(code) for code in load_fund_codes()]
+    categories, _source = resolve_fund_categories(client)
+    fund_codes = [normalize_fund_code(code) for code in fund_codes_from_categories(categories)]
     registry = load_index_registry()
     valuation_codes = ("H30269", "000300")
     # 基金层步数 = 每只基金净值 + 分红合并 1 步 + 档案 1 步
@@ -430,11 +470,12 @@ def refresh_all(client, progress: SyncProgress | None = None) -> list[dict]:
 
     tracker.report(total, "同步完成")
 
+    error_count = sum(1 for r in results if "error" in r)
     insert_sync_log(
         client,
         job_name="refresh_all",
-        status="success" if not any("error" in r for r in results) else "partial",
-        message=f"Refreshed {len(fund_codes)} funds + index/rate/valuation/factors",
+        status="success" if not error_count else "partial",
+        message=f"Refreshed {len(fund_codes)} funds + index/rate/valuation/factors; errors={error_count}",
         row_count=0,
     )
     return results
@@ -455,7 +496,8 @@ def refresh_layer(client, layer_key: str, progress: SyncProgress | None = None) 
     """
     layer_key = (layer_key or "").lower()
     if layer_key == "fund":
-        fund_codes = [normalize_fund_code(code) for code in load_fund_codes()]
+        categories, _source = resolve_fund_categories(client)
+        fund_codes = [normalize_fund_code(code) for code in fund_codes_from_categories(categories)]
         tracker = SyncProgress(len(fund_codes) + 2, progress)
         tracker.report(0, f"基金层：共 {len(fund_codes)} 只基金")
         results = _refresh_funds(client, fund_codes, tracker)

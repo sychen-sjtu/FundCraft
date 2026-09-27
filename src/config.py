@@ -192,8 +192,10 @@ def load_fund_codes(project_root: Path | None = None) -> list[str]:
 
 
 def load_market_index_codes(project_root: Path | None = None) -> list[str]:
-    """读取我的基金页顶部市场指数条展示的指数代码（TOML [ui.market_indexes].codes）。
+    """读取 TOML 里的市场指数条配置（[ui.market_indexes].codes）。
 
+    ⚠️ 运行期不再使用：指数条配置已改为存在库表 ``ui_index_list``（网页端「⭐ 基金配置」页
+    增删）。本函数只作为**一次性迁移**（scripts/check_fund_config.py --seed）的输入。
     顺序即展示顺序；缺省回退 ["000001", "000300"]（上证指数、沪深300）。
     """
     root = project_root or Path(__file__).resolve().parents[1]

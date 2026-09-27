@@ -33,24 +33,53 @@ key = "enc:..."
 
 解密时，程序会从 `.streamlit/secrets.toml` 读取密文，并根据口令自动解密。
 
-## 基金代码配置
+## 基金与指数配置（网页端管理）
 
-基金代码统一在 `.streamlit/secrets.toml` 的 `[funds.categories.<类别>]` 段按类别配置，正式抓取任务会从这里读取：
+关注列表由网页端 **「⭐ 基金配置」页** 管理，存在 Supabase 的 `fund_category` /
+`fund_category_member` 两张表里。**运行期以库表为唯一来源**：按类别增删基金代码，
+改完即生效，不用改文件、也不用重启。
+
+首次部署分两步：
+
+1. 在 Supabase SQL Editor 执行 `sql/schema.sql`（唯一的建表脚本，幂等，可反复执行）；
+2. 执行一次 `python scripts/check_fund_config.py --seed`，把 `.streamlit/secrets.toml`
+   里现成的配置灌进库表（只增不覆盖，可安全重复执行）。
+
+`.streamlit/secrets.toml` 的 `[funds.categories.<类别>]` 从此只是**一次性迁移的输入**，
+运行期完全不读它：**配置表没建、或数据库连不上，就是「没有基金」**，不会回退到文件配置。
+格式（也是 seed 的输入）如下：
 
 ```toml
-[funds.categories."低波红利"]
+[funds.categories."红利低波"]
 fund_codes = ["008163"]
 panel = "红利低波"                    # 决定该类别基金的展示面板
 index_codes = { "008163" = "H30269" } # 基金 -> 对应底层指数（用于拉取指数股息率）
 
 [funds.categories."固收+"]
 fund_codes = ["206018", "100018"]
-panel = "固收"
+panel = "固收+"
 ```
 
-> 注意：类别名含中文，TOML 表头键需要用双引号包裹（`[funds.categories."低波红利"]`）。
-> `panel` 可选值见 `src/ui/panels.py` 的 `PANEL_REGISTRY`（目前：`净值` / `固收` / `红利低波`），缺省为 `净值`。新增面板类型只需在注册表登记渲染函数，无需改 UI 主逻辑。
-> `index_codes`：基金对应的底层指数代码，用于拉取**指数股息率**作为策略因子（估值入库累积，见下）。
+> 注意：类别名含中文，TOML 表头键需要用双引号包裹（`[funds.categories."红利低波"]`）。
+> `panel` 可选值见 `src/storage/fund_config.py` 的 `PANEL_OPTIONS`（目前：`净值` / `固收+` / `债基` / `红利低波`），缺省为 `净值`。
+> `index_codes`：基金对应的底层指数代码，用于拉取**指数股息率**作为策略因子（估值入库累积）。
+> 新增基金后，请到「🗄️ 数据管理」执行一次基金层刷新，净值与档案才会入库。
+
+### 市场指数条（同样在网页端管理）
+
+总览页顶部的市场指数条由同一页的「📊 市场指数条」区管理（表 `ui_index_list`，
+`list_key = market_indexes`）：加代码即加入、点移除即撤下，顺序即展示顺序。
+同样**只从库表读**，配置表没建或数据库连不上就是空指数条。
+
+> 注意：指数要显示行情，仍需在 `.streamlit/secrets.toml` 的 `[indexes.registry]` 里登记，
+> 同步任务才会抓它的行情（未登记的指数在指数条上显示「暂无」）。
+> seed 会把 `[ui.market_indexes].codes` 里的现有指数一并导入库表。
+
+### 缓存与刷新
+
+读取缓存有效期 12 小时（业务数据只在刷新时变化，刷新会主动清缓存）。
+若数据是在别处（另一台机器 / 命令行）更新的，点「🗄️ 数据管理」页的
+「🔄 重新读取服务器数据（清缓存）」即可立刻生效。
 
 ## 口令与数据访问
 
@@ -98,7 +127,7 @@ python -m src.storage.strategy_sync_runner --entity rate --code cn_10y
   - **官方值**（`stock_zh_index_value_csindex`）只返回近约 20 个交易日，走 `index_valuation_history` **入库累积**（source=csindex），是唯一落库的估值数据；
   - **推导历史值**（用「全收益/价格指数比」，如 H20269/H30269）在**内存中**补齐官方缺失的长历史（2013 至今），**不落库**；
   - 因子重算时两者合并、**官方值优先**，因此最近日期用官方口径，历史用推导近似（比官方约高 +0.3pp、更平滑）。
-* 建表/迁移脚本见 `sql/create_strategy_tables.sql`（幂等，可反复执行），设计说明见 `docs/数据持久化与增量同步设计方案.md`。
+* 建表/迁移脚本见 `sql/schema.sql`（唯一的建表脚本，幂等，可反复执行），设计说明见 `docs/数据持久化与增量同步设计方案.md`。
 
 ## Stage 5 本地展示运行方式
 

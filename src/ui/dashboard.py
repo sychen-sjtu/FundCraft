@@ -3,7 +3,7 @@
 流程：
 1. 未解锁（未连接 Supabase）时，显示全屏开屏解锁页（类似系统登录界面），
    输入解密口令后连接 Supabase 进入主界面。
-2. 解锁后渲染侧边导航（总览 / 数据管理）并分发到各页面；
+2. 解锁后渲染侧边导航（总览 / 基金配置 / 数据管理）并分发到各页面；
    侧边栏默认收起，需要时可展开。
 3. 详情页不在侧边栏中，通过总览页基金卡片进入。
 
@@ -18,17 +18,20 @@ from src.ui.theme import inject_global_css
 from src.ui import store
 from src.ui import data as data_view
 from src.ui import detail as detail_view
+from src.ui import funds as funds_view
 from src.ui import home as home_view
 
 # 页面状态键（稳定值，不含 emoji，避免字符串匹配问题）
 PAGE_HOME = "overview"
+PAGE_FUNDS = "funds"
 PAGE_DETAIL = "detail"
 PAGE_DATA = "data"
 
 # 侧边导航项：(键, 显示标签)。
-# 策略随基金绑定，在各基金详情页内展示，不放入侧边栏；详情页通过卡片点击进入。
+# 基金关注列表在「基金配置」页维护；详情页不在侧边栏中，通过总览页卡片点击进入。
 NAV_ITEMS = [
     (PAGE_HOME, "📊 总览"),
+    (PAGE_FUNDS, "⭐ 基金配置"),
     (PAGE_DATA, "🗄️ 数据管理"),
 ]
 NAV_KEYS = [key for key, _ in NAV_ITEMS]
@@ -169,6 +172,8 @@ def render_dashboard() -> None:
 
     if page == PAGE_DETAIL:
         detail_view.render()
+    elif page == PAGE_FUNDS:
+        funds_view.render()
     elif page == PAGE_DATA:
         data_view.render()
     else:

@@ -97,6 +97,14 @@ def _render_management_actions() -> None:
         if st.button("♻️ 强制全量刷新", use_container_width=True):
             _run_refresh(full=True)
 
+    # ---------- 只清缓存、不刷新数据 ----------
+    # 读取缓存 TTL 是 12 小时；若数据在别处（另一台机器 / 命令行同步）更新过，
+    # 用这个按钮强制本会话重新从服务器读取。
+    st.caption("若数据在别处更新过（另一台机器 / 命令行），点这里清掉本会话缓存并重新读取。")
+    if st.button("🔄 重新读取服务器数据（清缓存）", use_container_width=True):
+        store.clear_read_caches()
+        st.rerun()
+
     # ---------- 数据分层状态 ----------
     st.markdown("**数据分层状态**")
     layers = store.get_refresh_layers()

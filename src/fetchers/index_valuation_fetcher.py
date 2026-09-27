@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import date
 from functools import lru_cache
+import re
 
 import akshare as ak
 import numpy as np
@@ -73,6 +74,22 @@ def derive_index_dividend_yield(index_code: str, *, window_days: int = DERIVE_WI
 TOTAL_RETURN_CODES = frozenset({"H20269", "H00300", "000300S"})
 
 
+def _compact_date(value: str | None, fallback: str) -> str:
+    """把日期归一成 csindex/akshare 需要的 ``YYYYMMDD``。
+
+    同时接受 ``2026-02-02``（ISO）与 ``20260202``（紧凑）两种写法 —— 曾因调用方传入
+    ISO 格式导致中证接口抛 TypeError、指数行情静默停更六周（见 _refresh_indexes 的看门狗）。
+    无法识别时直接抛错，而不是静默回落成全量抓取（避免掩盖调用方问题）。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    digits = re.sub(r"\D", "", text)
+    if len(digits) != 8:
+        raise ValueError(f"无法识别的日期格式：{value!r}（应为 YYYYMMDD 或 YYYY-MM-DD）")
+    return digits
+
+
 def _fetch_index_daily_sina(index_code: str, *, start_date: str | None = None) -> pd.DataFrame:
     """新浪源兜底：csindex 不收录的指数（深交所 399xxx 等）。
 
@@ -119,21 +136,23 @@ def _fetch_index_daily_sina(index_code: str, *, start_date: str | None = None) -
 def fetch_index_daily_history(index_code: str, *, start_date: str = "20000101", end_date: str | None = None) -> pd.DataFrame:
     """抓取指数日行情全历史（csindex 官方优先；csindex 不收录的指数回落新浪源）。
 
+    :param start_date: ``YYYYMMDD`` 或 ``YYYY-MM-DD``（内部统一成 ``YYYYMMDD`` 后再请求）。
     :return: DataFrame(index_code, trade_date, open, high, low, close, change_pct, volume, amount, index_type[, source])
     """
-    end = end_date or date.today().strftime("%Y%m%d")
+    start = _compact_date(start_date, "20000101")
+    end = _compact_date(end_date, date.today().strftime("%Y%m%d"))
     # csindex 对部分代码偶发返回空，akshare 会抛 Length mismatch；加健壮处理 + 重试
     raw_df = None
     for _ in range(3):
         try:
-            raw_df = ak.stock_zh_index_hist_csindex(symbol=index_code, start_date=start_date, end_date=end)
+            raw_df = ak.stock_zh_index_hist_csindex(symbol=index_code, start_date=start, end_date=end)
             if raw_df is not None and not raw_df.empty:
                 break
         except Exception:  # noqa: BLE001
             raw_df = None
     if raw_df is None or raw_df.empty:
         # csindex 不收录（如深交所 399xxx）→ 新浪源兜底
-        return _fetch_index_daily_sina(index_code, start_date=start_date)
+        return _fetch_index_daily_sina(index_code, start_date=start)
 
     rename = {
         "日期": "trade_date", "开盘": "open", "最高": "high", "最低": "low",
