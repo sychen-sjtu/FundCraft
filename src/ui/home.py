@@ -13,7 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from src.ui import store
-from src.ui.theme import fund_card_html, render_index_bar
+from src.ui.theme import fund_card_html, is_missing, render_index_bar
 
 
 def _render_bond_comparison(codes: list[str]) -> None:
@@ -24,7 +24,7 @@ def _render_bond_comparison(codes: list[str]) -> None:
         return
 
     def _pct_cell(value) -> str:
-        if value is None:
+        if is_missing(value):
             return '<span class="fc-flat fc-num">—</span>'
         value = float(value)
         cls = "fc-up" if value > 0 else ("fc-down" if value < 0 else "fc-flat")
@@ -32,7 +32,7 @@ def _render_bond_comparison(codes: list[str]) -> None:
         return f'<span class="{cls} fc-num">{sign}{value:.2f}%</span>'
 
     def _num_cell(value, unit: str = "") -> str:
-        if value is None:
+        if is_missing(value):
             return '<span class="fc-flat fc-num">—</span>'
         return f'<span class="fc-num">{float(value):.2f}{unit}</span>'
 

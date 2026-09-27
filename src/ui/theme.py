@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pandas as pd
 import streamlit as st
 
@@ -317,28 +319,41 @@ def inject_global_css() -> None:
 
 
 # ---------- 涨跌颜色渲染 ----------
+def is_missing(value) -> bool:
+    """统一判空：None / NaN / ±inf / 非数值 都算缺失。
+
+    界面上一律显示「—」，绝不让 NaN 漏成 "nan%"（新增基金还没净值时踩过这个坑）。
+    """
+    if value is None:
+        return True
+    try:
+        if bool(pd.isna(value)):
+            return True
+    except (TypeError, ValueError):
+        return True
+    try:
+        return not math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return True
+
+
 def change_class(value) -> str:
     """根据数值返回涨跌 CSS 类名。"""
-    if value is None:
+    if is_missing(value):
         return "fc-flat"
-    try:
-        if float(value) > 0:
-            return "fc-up"
-        if float(value) < 0:
-            return "fc-down"
-    except (TypeError, ValueError):
-        return "fc-flat"
+    number = float(value)
+    if number > 0:
+        return "fc-up"
+    if number < 0:
+        return "fc-down"
     return "fc-flat"
 
 
 def change_html(value, suffix: str = "%", digits: int = 2, plus: bool = True) -> str:
     """渲染带涨跌颜色的数值 HTML（如 `+1.23%` / `-0.45%`）。"""
-    if value is None:
+    if is_missing(value):
         return '<span class="fc-flat fc-num">—</span>'
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return '<span class="fc-flat fc-num">—</span>'
+    value = float(value)
     cls = change_class(value)
     sign = "+" if (plus and value > 0) else ""
     return f'<span class="{cls} fc-num">{sign}{value:.{digits}f}{suffix}</span>'

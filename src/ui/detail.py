@@ -24,7 +24,7 @@ from src.ui.charts import (
     build_performance_drawdown_chart,
     build_rsi_dashboard_chart,
 )
-from src.ui.theme import COLOR_BENCHMARK, COLOR_FUND_HIGHLIGHT, PLOTLY_CONFIG, detail_head_html
+from src.ui.theme import COLOR_BENCHMARK, COLOR_FUND_HIGHLIGHT, PLOTLY_CONFIG, detail_head_html, is_missing
 
 
 def _render_back_and_header(code: str) -> None:
@@ -138,8 +138,9 @@ def _latest_cum_return(frame: pd.DataFrame, col: str | None = None) -> float | N
 
 
 def _pct_cls(value) -> str:
-    if value is None:
+    if is_missing(value):
         return "flat"
+    value = float(value)
     if value > 0:
         return "up"
     if value < 0:
@@ -148,8 +149,9 @@ def _pct_cls(value) -> str:
 
 
 def _fmt_pct(value) -> str:
-    if value is None:
+    if is_missing(value):
         return "—"
+    value = float(value)
     sign = "+" if value > 0 else ""
     return f"{sign}{value:.2f}%"
 
@@ -447,13 +449,14 @@ def _render_bond_metrics(code: str, *, title: str = "核心指标") -> None:
     m = store.get_fund_bond_metrics(code)
 
     def _pct(value) -> str | None:
-        if value is None:
+        if is_missing(value):
             return None
+        value = float(value)
         sign = "+" if value > 0 else ""
         return f"{sign}{value:.2f}"
 
     def _num(value) -> str | None:
-        return None if value is None else f"{value:.2f}"
+        return None if is_missing(value) else f"{float(value):.2f}"
 
     ann = _pct(m["annualized_return"])
     mdd = _pct(m["max_drawdown"])
@@ -495,10 +498,11 @@ def _bond_quote_cell(label: str, quote: dict) -> str:
     """行情宫格单元格：名称 + 价格 + 今日涨跌%（红涨绿跌，无数据显「—」）。"""
     price = quote.get("price")
     pct = quote.get("pct")
-    price_text = f"{price:.3f}" if price is not None else "—"
-    if pct is None:
+    price_text = "—" if is_missing(price) else f"{float(price):.3f}"
+    if is_missing(pct):
         pct_cls, pct_text = "neutral", "暂无"
     else:
+        pct = float(pct)
         pct_cls = "up" if pct > 0 else ("down" if pct < 0 else "flat")
         pct_text = f"{pct:+.2f}%"
     value_html = (
@@ -560,7 +564,8 @@ def _render_bond_signal_result(result: dict, code: str) -> None:
     nav_prev2 = result.get("nav_prev2", [])
     signal = result.get("signal", {})
 
-    nav_text = "、".join(f"{v:+.2f}%" for v in nav_prev2) if nav_prev2 else "暂无"
+    valid_nav = [float(v) for v in nav_prev2 if not is_missing(v)]
+    nav_text = "、".join(f"{v:+.2f}%" for v in valid_nav) if valid_nav else "暂无"
     card_html = (
         '<div class="fc-bond-card">'
         '<div class="fc-bond-title">今日盘中行情</div>'

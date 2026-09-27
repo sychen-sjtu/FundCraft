@@ -949,8 +949,15 @@ def _compute_period_returns_from(frame: pd.DataFrame, periods: list[str]) -> dic
         return {p: None for p in periods}
     # 分红基金（如 008163 每月分红）必须用复权净值，否则区间收益被低估；无复权时回退单位净值
     col = "adjusted_nav" if "adjusted_nav" in ordered.columns and ordered["adjusted_nav"].notna().any() else "unit_nav"
+    # 关键加固：净值列为空的行不能参与计算 —— 否则基准日恰好落在空值上时，
+    # base 会是 NaN，区间收益一路变成 NaN，界面显示成 "nan%"（新增基金曾出现）。
+    ordered = ordered.dropna(subset=[col]).reset_index(drop=True)
+    if ordered.empty:
+        return {p: None for p in periods}
     latest_ts = ordered["nav_date"].iloc[-1]
     latest = float(ordered[col].iloc[-1])
+    if pd.isna(latest) or not latest:
+        return {p: None for p in periods}
     for label in periods:
         # 月标签（近1月/近3月/...）统一用自然月回推，与详情业绩走势表、官方区间涨幅口径一致
         months = _PERIOD_MONTHS.get(label)
@@ -964,12 +971,12 @@ def _compute_period_returns_from(frame: pd.DataFrame, periods: list[str]) -> dic
             days = _PERIOD_DAYS.get(label)
             if days is None:
                 base = float(ordered[col].iloc[0])
-                result[label] = (latest / base - 1.0) * 100.0 if base else None
+                result[label] = (latest / base - 1.0) * 100.0 if base and not pd.isna(base) else None
                 continue
             cutoff = latest_ts - pd.Timedelta(days=days)
         past = ordered[ordered["nav_date"] <= cutoff]
         base = float(past[col].iloc[-1]) if not past.empty else float(ordered[col].iloc[0])
-        result[label] = (latest / base - 1.0) * 100.0 if base else None
+        result[label] = (latest / base - 1.0) * 100.0 if base and not pd.isna(base) else None
     return result
 
 
@@ -1286,7 +1293,10 @@ def _all_funds_overview(url: str, key: str, codes: tuple[str, ...]) -> pd.DataFr
 def _compute_latest_from(frame: pd.DataFrame) -> dict:
     if frame.empty:
         return {"nav_date": None, "unit_nav": None, "daily_return_pct": None}
-    ordered = frame.sort_values("nav_date").reset_index(drop=True)
+    # 单位净值为空/NaN 的行不能作为"最新净值"（否则卡片会显示 nan）
+    ordered = frame.sort_values("nav_date").dropna(subset=["unit_nav"]).reset_index(drop=True)
+    if ordered.empty:
+        return {"nav_date": None, "unit_nav": None, "daily_return_pct": None}
     last = ordered.iloc[-1]
     daily_return = last.get("daily_return")
     return {
